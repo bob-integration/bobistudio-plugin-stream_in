@@ -3,7 +3,7 @@
   "label": "Stream In",
   "runtime": "docker",
   "image": "media",
-  "version": "0.1.6",
+  "version": "0.2.1",
   "script_template": "script.py",
   "ui": {
     "control_html": "control.html",
@@ -40,7 +40,8 @@
     "genlock": true,
     "genlock_phase_ms": 0.0,
     "idle_mode": "bars",
-    "freeze_timeout_ms": 1000
+    "freeze_timeout_ms": 1000,
+    "enabled": true
   },
   "config_schema": [
     {
@@ -48,6 +49,7 @@
       "type": "select",
       "label": "Mode d'ingest",
       "default": "srt_listener",
+      "help": "Écoute : la source pousse vers l'adresse affichée sur la page du plugin. Appel/pull : le plugin va chercher le flux.",
       "options": [
         {
           "value": "srt_listener",
@@ -69,34 +71,6 @@
       "scope": "system"
     },
     {
-      "key": "url",
-      "type": "text",
-      "label": "URL distante",
-      "placeholder": "srt://hôte:port ou rtmp://hôte/app/clé",
-      "visible_if": {
-        "mode": [
-          "srt_caller",
-          "rtmp_pull"
-        ]
-      },
-      "scope": "system"
-    },
-    {
-      "key": "listen_port",
-      "type": "number",
-      "label": "Port d'écoute",
-      "min": 1024,
-      "max": 65535,
-      "default": 9000,
-      "visible_if": {
-        "mode": [
-          "srt_listener",
-          "rtmp_server"
-        ]
-      },
-      "scope": "system"
-    },
-    {
       "key": "srt_latency_ms",
       "type": "number",
       "label": "Latence SRT (ms)",
@@ -114,7 +88,8 @@
     {
       "key": "srt_passphrase",
       "type": "text",
-      "label": "Passphrase SRT (optionnelle)",
+      "label": "Passphrase SRT",
+      "placeholder": "facultative",
       "visible_if": {
         "mode": [
           "srt_listener",
@@ -126,7 +101,8 @@
     {
       "key": "srt_streamid",
       "type": "text",
-      "label": "Stream ID SRT (optionnel)",
+      "label": "Stream ID SRT",
+      "placeholder": "facultatif",
       "visible_if": {
         "mode": [
           "srt_listener",
@@ -136,106 +112,10 @@
       "scope": "system"
     },
     {
-      "key": "rtmp_app",
-      "type": "text",
-      "label": "Application RTMP",
-      "default": "live",
-      "visible_if": {
-        "mode": "rtmp_server"
-      },
-      "scope": "system"
-    },
-    {
-      "key": "rtmp_key",
-      "type": "text",
-      "label": "Clé de flux RTMP (vide = stream)",
-      "visible_if": {
-        "mode": "rtmp_server"
-      },
-      "scope": "system"
-    },
-    {
-      "key": "width",
-      "type": "number",
-      "label": "Largeur sortie (px)",
-      "min": 320,
-      "max": 3840,
-      "step": 2,
-      "default": 1920,
-      "scope": "system"
-    },
-    {
-      "key": "height",
-      "type": "number",
-      "label": "Hauteur sortie (px)",
-      "min": 180,
-      "max": 2160,
-      "step": 2,
-      "default": 1080,
-      "scope": "system"
-    },
-    {
-      "key": "fps",
-      "type": "number",
-      "label": "Cadence sortie (fps)",
-      "min": 1,
-      "max": 60,
-      "default": 50,
-      "scope": "system"
-    },
-    {
-      "key": "chroma",
-      "type": "select",
-      "label": "Chroma sortie",
-      "default": "422",
-      "options": [
-        {
-          "value": "420",
-          "label": "YUV 4:2:0"
-        },
-        {
-          "value": "422",
-          "label": "YUV 4:2:2"
-        },
-        {
-          "value": "444",
-          "label": "YUV 4:4:4"
-        }
-      ],
-      "scope": "system"
-    },
-    {
-      "key": "bit_depth",
-      "type": "select",
-      "label": "Profondeur sortie",
-      "default": "8",
-      "options": [
-        {
-          "value": "8",
-          "label": "8 bits"
-        },
-        {
-          "value": "10",
-          "label": "10 bits"
-        }
-      ],
-      "scope": "system"
-    },
-    {
-      "key": "scan",
-      "type": "select",
-      "label": "Balayage sortie",
-      "default": "p",
-      "options": [
-        {
-          "value": "p",
-          "label": "Progressif"
-        },
-        {
-          "value": "i",
-          "label": "Entrelacé"
-        }
-      ],
+      "key": "genlock",
+      "type": "checkbox",
+      "label": "Genlock (grille PTP)",
+      "default": true,
       "scope": "system"
     },
     {
@@ -262,14 +142,8 @@
       "min": 100,
       "max": 30000,
       "default": 1000,
+      "help": "Au-delà, la dernière image est répétée et l'état passe à « gelé ».",
       "scope": "user"
-    },
-    {
-      "key": "genlock",
-      "type": "checkbox",
-      "label": "Genlock (grille PTP)",
-      "default": true,
-      "scope": "system"
     }
   ],
   "wiring": {
@@ -290,10 +164,18 @@
     "port": 8082,
     "endpoints": [
       "/state",
-      "/reconnect"
+      "/reconnect",
+      "/source",
+      "/enable",
+      "/events",
+      "/events/clear"
     ],
     "read_endpoints": [
-      "/state"
+      "/state",
+      "/events"
     ]
+  },
+  "store": {
+    "unique_name": true
   }
 }

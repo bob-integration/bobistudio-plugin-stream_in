@@ -16,7 +16,30 @@ L'IP affichée est celle du **conteneur** (macvlan) : elle est directement joign
 LAN, sans redirection de port. Le port d'écoute est libre — vérifier qu'il ne collisionne
 pas avec une autre instance sur le même nœud.
 
+## Point d'entrée
+
+L'adresse affichée dans le panneau **est** l'adresse réglable : le port (modes écoute), les
+segments application et clé (RTMP serveur) ou l'URL distante (modes appel et pull) s'éditent
+directement là où ils sont lus. Appliquer relance la connexion sans redéployer, la sortie MXL
+n'est pas coupée. Les huit dernières adresses utilisées restent accessibles en un clic.
+
+L'**interrupteur Ingest** coupe ffmpeg sans arrêter le conteneur : la sortie continue d'émettre
+la mire à la cadence configurée, les consommateurs câblés ne voient aucune rupture.
+
+## Journal de connexion
+
+Chaque transition d'état, redémarrage de ffmpeg, erreur, changement de source et bascule
+marche/arrêt est horodaté dans un journal persistant, qui survit au redémarrage du script.
+Consultable par plage date/heure et exportable en CSV : c'est la pièce justificative quand il
+faut établir d'où venait une coupure. Les horodatages viennent du conteneur, dont l'horloge est
+disciplinée par PTP, donc comparables avec le reste de la chaîne. Vider le journal est possible,
+demande confirmation, et l'effacement est lui-même consigné.
+
 ## Format de sortie (conform)
+
+Le format de sortie se choisit au déploiement, dans le sélecteur de format de la palette,
+alimenté par Réglages → Formats vidéo. Le panneau affiche côte à côte le format **réel** de la
+source (avant conform) et le format de sortie.
 
 Le flux entrant est **toujours reconverti** au format configuré (résolution, cadence, chroma,
 profondeur, balayage) : scale bicubique, conversion de cadence, désentrelacement automatique

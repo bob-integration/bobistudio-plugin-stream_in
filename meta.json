@@ -1,7 +1,18 @@
 {
-  "version": "0.1.6",
+  "version": "0.2.1",
   "date": "2026-07-09",
   "changes": {
+    "Refonte de l'interface + journal de connexion (0.2.0 → 0.2.1)": [
+      "Formulaire ⚙ ramené de 17 champs à 7 : le format de sortie vient désormais du sélecteur universel de la palette (alimenté par Réglages → Formats vidéo) au lieu d'être redéclaré, et l'adresse quitte le formulaire.",
+      "Point d'entrée éditable EN PLACE : l'adresse affichée est l'adresse réglable (port, application et clé RTMP, ou URL distante). Appliquée à chaud via le hook control_action, sans redéployer ni couper la sortie MXL. Une seule vérité.",
+      "Interrupteur marche/arrêt de l'ingest : ffmpeg est coupé, la sortie MXL continue d'émettre la mire à la cadence genlock. Persisté (params.enabled).",
+      "Sources récentes : les 8 dernières adresses utilisées, mémorisées par instance (plugin_store) et réapplicables en un clic.",
+      "Format RÉEL de la source affiché avant conform (résolution, cadence, codec, audio), à côté du format de sortie : on voit immédiatement qu'une source 720p25 est remontée en 1080p50.",
+      "Courbe du débit entrant sur 2 minutes, annotée des images gelées et des silences audio, avec curseur et infobulle. Le débit est mesuré sur les compteurs réseau du conteneur (macvlan : hors ingest, son trafic entrant est négligeable).",
+      "Santé du chemin audio repliée (latence, famines, échantillons jetés, ré-ancrages) et derniers messages ffmpeg.",
+      "JOURNAL DE CONNEXION persistant (JSONL, survit au redémarrage du script, roté à 4 Mo) : transitions d'état, redémarrages ffmpeg, erreurs, changements de source, marche/arrêt. Consultable par plage date/heure et exportable en CSV pour justifier une coupure a posteriori. Effacement possible, confirmé, et lui-même tracé.",
+      "Correction : les lignes « Stream #0:x » des sections Input et Output de ffmpeg ont la même forme ; sans garde-fou le plugin décrivait sa PROPRE sortie comme étant la source (0.2.1)."
+    ],
     "Audio : clics, désynchronisation et sautillement corrigés (0.1.1 → 0.1.6)": [
       "Sautillement (0.1.6) : le bus MXL a un contrat de granularité de 1 ms — le streamer lit par blocs de 1 ms et, dès qu'un passage ne trouve pas de bloc complet, injecte du silence pour combler les ms écoulées. En écrivant par blocs de 5 ms, `head_index` avançait par sauts de 5 ms : le consommateur tournait à vide 4 passages sur 5 et bourrait du silence. Écriture ramenée à 1 ms (comme player/avsync), période du feeder < 1 ms pour que la tête avance en continu. Mesuré : 0 silence injecté sur 6 s, à parité avec le player. (NB : le réglage `mtl_audio_ptime` 1 ms/125 µs est le packet time RÉSEAU ST 2110-30, pas la granularité du bus.)",
       "Clics/bruit (0.1.1) : `AudioWriter.write()` sans index explicite recalcule `mxlGetCurrentIndex() - n` à chaque appel — deux écritures rapprochées retombaient sur le même index (écrasement) ou en sautaient (les vieux échantillons du ring ressortaient). ~220 discontinuités/s mesurées. Le feeder ancre désormais une fois sur la grille d'échantillons TAI et écrit à un index strictement contigu.",

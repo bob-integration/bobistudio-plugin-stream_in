@@ -4,7 +4,7 @@
 # désentrelacement) ; le feeder genlock écrit une trame par tick de grille PTP dans TOUS les
 # états (attente/connecté/gelé) → signal MXL continu, jamais de trou, y compris pendant les
 # redémarrages ffmpeg. Audio décodé en float32 48 kHz 8ch vers un flux MXL AudioWriter.
-import os, json, time, signal, threading, subprocess, collections
+import os, re, json, time, signal, threading, subprocess, collections, urllib.parse
 import numpy as np
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -34,14 +34,21 @@ def _rate_nd(v):
     return nominal * 1000, 1001
 
 # ─── config ──────────────────────────────────────────────────────────────────
-MODE           = str(CONFIG.get("mode") or "srt_listener")
-URL            = str(CONFIG.get("url") or "").strip()
-LISTEN_PORT    = int(CONFIG.get("listen_port") or 9000)
-SRT_LATENCY_MS = int(CONFIG.get("srt_latency_ms") or 200)
-SRT_PASSPHRASE = str(CONFIG.get("srt_passphrase") or "")
-SRT_STREAMID   = str(CONFIG.get("srt_streamid") or "")
-RTMP_APP       = str(CONFIG.get("rtmp_app") or "live").strip("/") or "live"
-RTMP_KEY       = str(CONFIG.get("rtmp_key") or "").strip("/")
+MODE = str(CONFIG.get("mode") or "srt_listener")
+
+# Le POINT D'ENTRÉE est modifiable à chaud (:8082/source) : il vit dans un dict sous verrou,
+# pas dans des constantes. Le format de sortie, lui, est structurel (redéploiement).
+src_lock = threading.Lock()
+_src = {{
+    "url":            str(CONFIG.get("url") or "").strip(),
+    "listen_port":    int(CONFIG.get("listen_port") or 9000),
+    "srt_latency_ms": int(CONFIG.get("srt_latency_ms") or 200),
+    "srt_passphrase": str(CONFIG.get("srt_passphrase") or ""),
+    "srt_streamid":   str(CONFIG.get("srt_streamid") or ""),
+    "rtmp_app":       str(CONFIG.get("rtmp_app") or "live").strip("/") or "live",
+    "rtmp_key":       str(CONFIG.get("rtmp_key") or "").strip("/"),
+}}
+ENABLED = _as_bool(CONFIG.get("enabled", True), default=True)
 
 WIDTH  = int(CONFIG.get("width") or 1920)
 HEIGHT = int(CONFIG.get("height") or 1080)
@@ -88,13 +95,14 @@ AUDIO_FIFO = "/tmp/stream_in_audio.f32"
 # ─── état partagé ────────────────────────────────────────────────────────────
 metrics_lock = threading.Lock()
 metrics = {{"fps": 0.0, "frame_index": 0, "plugin_version": PLUGIN_VERSION,
-           "conn_state": "waiting", "mode": MODE, "listen_port": LISTEN_PORT,
+           "conn_state": "waiting", "mode": MODE,
            "last_frame_age_ms": None, "ffmpeg_restarts": 0, "video_max_gap_ms": 0.0,
            "in_fps": 0.0,
            # Santé du chemin audio : famine (silence inséré), drop (buffer saturé) et
            # ré-ancrage (dérive horloge source ↔ grille TAI) — tous trois s'entendent.
            "audio_starve_blocks": 0, "audio_drop_samples": 0, "audio_reanchors": 0,
-           "audio_buf_ms": 0.0, "audio_in_sps": 0.0}}
+           "audio_buf_ms": 0.0, "audio_in_sps": 0.0,
+           "enabled": ENABLED, "net_in_kbps": 0.0}}
 
 frame_lock = threading.Lock()
 _last_frame = None            # bytes de la dernière trame conformée reçue
@@ -122,6 +130,74 @@ _proc_lock = threading.Lock()
 _reconnect_req = threading.Event()
 _reconnect_req_audio = threading.Event()   # /reconnect ré-arme l'essai audio
 _stderr_tail = collections.deque(maxlen=12)
+_enabled = threading.Event()               # ingest actif (marche/arrêt à chaud)
+if ENABLED:
+    _enabled.set()
+
+# Format RÉEL de la source, avant conform — parsé des lignes « Stream #0:x » de ffmpeg.
+_src_fmt = {{"video": None, "audio": None}}
+_RE_VIDEO = re.compile(r"Stream #\d+:\d+.*: Video: ([^,]+).*?(\d{{3,5}})x(\d{{3,5}}).*?([\d.]+) fps")
+_RE_AUDIO = re.compile(r"Stream #\d+:\d+.*: Audio: ([^,]+), (\d+) Hz, ([^,]+)")
+
+# Historique 2 min (1 échantillon/s) : débit réseau entrant + événements gel / silence audio.
+HIST_SECONDS = 120
+_hist = collections.deque(maxlen=HIST_SECONDS)
+_hist_lock = threading.Lock()
+
+# ─── journal de connexion (persistant) ──────────────────────────────────────
+# L'anneau de 2 min sert au diagnostic à chaud ; pour JUSTIFIER une coupure a posteriori il
+# faut une trace horodatée qui survit au redémarrage du script. JSONL append-only, tourné à
+# JOURNAL_MAX_BYTES. Horloge murale (CLOCK_REALTIME, disciplinée PTP) : les horodatages sont
+# comparables avec ceux des autres équipements de la chaîne.
+JOURNAL_PATH = "/opt/script/stream_in_events.jsonl"
+JOURNAL_MAX_BYTES = 4 * 1024 * 1024
+_journal_lock = threading.Lock()
+
+def journal(event, **fields):
+    rec = {{"ts": time.time(), "event": event}}
+    rec.update(fields)
+    line = json.dumps(rec, ensure_ascii=False)
+    with _journal_lock:
+        try:
+            if (os.path.exists(JOURNAL_PATH)
+                    and os.path.getsize(JOURNAL_PATH) > JOURNAL_MAX_BYTES):
+                os.replace(JOURNAL_PATH, JOURNAL_PATH + ".1")
+            with open(JOURNAL_PATH, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
+
+def journal_clear():
+    """Vide le journal. Trace immédiatement l'effacement : un journal vidé ne doit pas être
+    indistinguable d'un journal vierge (il sert de pièce justificative)."""
+    with _journal_lock:
+        for p in (JOURNAL_PATH, JOURNAL_PATH + ".1"):
+            try: os.unlink(p)
+            except FileNotFoundError: pass
+            except Exception: pass
+    journal("journal_cleared")
+
+def journal_read(t_from=None, t_to=None, limit=5000):
+    """Événements dans [t_from, t_to] (epoch s), plus anciens d'abord. Lit aussi le fichier
+    tourné : une coupure à cheval sur la rotation reste justifiable."""
+    out = []
+    for path in (JOURNAL_PATH + ".1", JOURNAL_PATH):
+        try:
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    try: rec = json.loads(line)
+                    except Exception: continue
+                    ts = rec.get("ts")
+                    if not isinstance(ts, (int, float)): continue
+                    if t_from is not None and ts < t_from: continue
+                    if t_to is not None and ts > t_to: continue
+                    out.append(rec)
+        except FileNotFoundError:
+            continue
+        except Exception:
+            continue
+    out.sort(key=lambda r: r["ts"])
+    return out[-int(limit):] if limit else out
 
 bus_error = threading.Event()
 def _handle_sigbus(signum, frame):
@@ -207,20 +283,23 @@ IDLE_FRAME  = BARS_FRAME if IDLE_MODE == "bars" else BLACK_FRAME
 
 # ─── commande ffmpeg par mode ────────────────────────────────────────────────
 def _input_url():
+    with src_lock:
+        s = dict(_src)
     if MODE == "srt_listener":
-        q = "mode=listener&latency=%d" % (SRT_LATENCY_MS * 1000)
-        if SRT_PASSPHRASE: q += "&passphrase=" + SRT_PASSPHRASE
-        if SRT_STREAMID:   q += "&streamid=" + SRT_STREAMID
-        return "srt://0.0.0.0:%d?%s" % (LISTEN_PORT, q)
+        q = "mode=listener&latency=%d" % (s["srt_latency_ms"] * 1000)
+        if s["srt_passphrase"]: q += "&passphrase=" + s["srt_passphrase"]
+        if s["srt_streamid"]:   q += "&streamid=" + s["srt_streamid"]
+        return "srt://0.0.0.0:%d?%s" % (s["listen_port"], q)
     if MODE == "srt_caller":
-        base = URL.split("?", 1)[0]
-        q = "mode=caller&latency=%d" % (SRT_LATENCY_MS * 1000)
-        if SRT_PASSPHRASE: q += "&passphrase=" + SRT_PASSPHRASE
-        if SRT_STREAMID:   q += "&streamid=" + SRT_STREAMID
+        base = s["url"].split("?", 1)[0]
+        q = "mode=caller&latency=%d" % (s["srt_latency_ms"] * 1000)
+        if s["srt_passphrase"]: q += "&passphrase=" + s["srt_passphrase"]
+        if s["srt_streamid"]:   q += "&streamid=" + s["srt_streamid"]
         return base + "?" + q
     if MODE == "rtmp_server":
-        return "rtmp://0.0.0.0:%d/%s/%s" % (LISTEN_PORT, RTMP_APP, RTMP_KEY or "stream")
-    return URL   # rtmp_pull : URL fournie telle quelle
+        return "rtmp://0.0.0.0:%d/%s/%s" % (s["listen_port"], s["rtmp_app"],
+                                            s["rtmp_key"] or "stream")
+    return s["url"]   # rtmp_pull : URL fournie telle quelle
 
 def _ffmpeg_cmd(with_audio=True):
     # bwdif deint=interlaced : ne désentrelace QUE les trames marquées entrelacées (passthrough
@@ -228,7 +307,10 @@ def _ffmpeg_cmd(with_audio=True):
     vf = ("bwdif=mode=send_frame:parity=auto:deint=interlaced,"
           "scale=%d:%d:flags=bicubic,fps=%d/%d,format=%s,setsar=1"
           % (WIDTH, HEIGHT, FPS_NUM, FPS_DEN, PIX_FMT))
-    cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "warning",
+    # -loglevel info : nécessaire pour lire le format réel de la source (lignes « Stream #0:x »).
+    # -nostats : à ce niveau ffmpeg écrirait ses lignes de progression en \r sur stderr, ce qui
+    # ferait bloquer le readline du drain jusqu'au prochain \n.
+    cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "info", "-nostats",
            "-analyzeduration", "10M", "-probesize", "10M"]
     if MODE == "rtmp_server":
         cmd += ["-listen", "1"]
@@ -309,12 +391,78 @@ def _audio_reader():
             time.sleep(0.5)
 
 def _stderr_drain(proc):
+    """ffmpeg tourne en -loglevel info : on y pêche le format RÉEL de la source (lignes
+    « Stream #0:x ») et on ne garde dans la queue d'erreurs que ce qui mérite l'œil.
+    Les sections « Input # » et « Output # » ont la MÊME forme de ligne Stream : sans ce
+    garde-fou on décrirait notre propre sortie (rawvideo 8ch) comme étant la source."""
+    in_input = False
     for line in iter(proc.stderr.readline, b""):
         try:
             s = line.decode("utf-8", "replace").strip()
-            if s: _stderr_tail.append(s)
         except Exception:
-            pass
+            continue
+        if not s:
+            continue
+        if s.startswith("Input #"):
+            in_input = True; continue
+        if s.startswith(("Output #", "Stream mapping:")):
+            in_input = False; continue
+        m = _RE_VIDEO.search(s) if in_input else None
+        if m:
+            _src_fmt["video"] = {{"codec": m.group(1).split()[0], "width": int(m.group(2)),
+                                 "height": int(m.group(3)), "fps": float(m.group(4))}}
+            continue
+        m = _RE_AUDIO.search(s) if in_input else None
+        if m:
+            _src_fmt["audio"] = {{"codec": m.group(1), "sample_rate": int(m.group(2)),
+                                 "layout": m.group(3).strip()}}
+            continue
+        low = s.lower()
+        if any(k in low for k in ("error", "failed", "invalid", "unable", "does not contain",
+                                  "connection", "timed out", "warning")):
+            _stderr_tail.append(s)
+            journal("ffmpeg_error", message=s[:400])
+
+# ─── débit réseau entrant (proxy du débit de la source) ─────────────────────
+# Le conteneur est en macvlan : hors flux d'ingest, son trafic entrant se limite au contrôle
+# HTTP (négligeable) — le MXL passe par la shm, pas par le réseau. rx_bytes est donc une
+# bonne mesure du débit de la source, sans dépendre de stats que ffmpeg n'expose pas.
+def _rx_bytes():
+    tot = 0
+    try:
+        with open("/proc/net/dev") as f:
+            for line in f.readlines()[2:]:
+                name, _, rest = line.partition(":")
+                if name.strip() in ("lo", ""):
+                    continue
+                tot += int(rest.split()[0])
+    except Exception:
+        return None
+    return tot
+
+def history_sampler():
+    """1 échantillon/s : débit entrant + drapeaux gel / silence audio sur la seconde écoulée.
+    Alimente la courbe du panneau (diagnostic a posteriori d'une chute ou d'un décrochage)."""
+    prev = _rx_bytes(); prev_t = time.monotonic()
+    prev_starve = metrics["audio_starve_blocks"]
+    while True:
+        time.sleep(1.0)
+        now = _rx_bytes(); now_t = time.monotonic()
+        kbps = 0.0
+        if prev is not None and now is not None and now >= prev:
+            kbps = round((now - prev) * 8.0 / 1000.0 / max(1e-3, now_t - prev_t), 1)
+        prev, prev_t = now, now_t
+        with metrics_lock:
+            conn = metrics["conn_state"]
+            starve = metrics["audio_starve_blocks"]
+            metrics["net_in_kbps"] = kbps
+        silence = 1 if (starve > prev_starve and _audio_seen) else 0
+        prev_starve = starve
+        with _hist_lock:
+            _hist.append({{"kbps": kbps,
+                          "freeze": 1 if conn == "frozen" else 0,
+                          "silence": silence,
+                          "off": 1 if conn == "off" else 0}})
 
 # ─── superviseur ffmpeg (poll + restart, backoff) ────────────────────────────
 def supervisor():
@@ -325,6 +473,12 @@ def supervisor():
     stall_kill_ms = max(10_000, FREEZE_TIMEOUT_MS * 10)
     with_audio = True
     while True:
+        if not _enabled.is_set():        # ingest coupé : la vidéo continue (mire), pas de ffmpeg
+            with frame_lock:
+                globals()["_last_frame"] = None
+                globals()["_last_frame_mono"] = None
+            _enabled.wait()
+            _src_fmt["video"] = _src_fmt["audio"] = None
         try:
             proc = subprocess.Popen(_ffmpeg_cmd(with_audio), stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE, bufsize=V_FRAME_SIZE)
@@ -337,7 +491,7 @@ def supervisor():
         threading.Thread(target=_stderr_drain, args=(proc,), daemon=True).start()
         got_any = False
         while proc.poll() is None:
-            if _reconnect_req.is_set():
+            if _reconnect_req.is_set() or not _enabled.is_set():
                 _reconnect_req.clear()
                 try: proc.kill()
                 except Exception: pass
@@ -361,6 +515,8 @@ def supervisor():
         restarts += 1
         with metrics_lock:
             metrics["ffmpeg_restarts"] = restarts
+        journal("ffmpeg_restart", n=restarts, got_frames=got_any,
+                last_error=(_stderr_tail[-1] if _stderr_tail else None))
         # Flux sans piste audio : la sortie fifo n'a aucun stream et ffmpeg refuse de démarrer
         # → bascule vidéo seule (ré-armé au prochain déploiement/reconnect).
         if with_audio and any("does not contain any stream" in s for s in _stderr_tail):
@@ -377,6 +533,7 @@ def video_feeder():
     shm = bobimxl.Writer(inst, VIDEO_SHM, WIDTH, HEIGHT, CHROMA, BIT_DEPTH, FPS_NUM, FPS_DEN,
                          index_mode=("tai" if GENLOCK else "free"), interlace=SCAN)
     idx = 0
+    last_conn = None
     period_ns = round(1e9 * FPS_DEN / FPS_NUM)
     kf = _grid_k(_grid_now_ns()) + 2
     win_cnt = 0; win_t0 = _grid_now_ns(); win_max_gap = 0; last_w = win_t0
@@ -399,12 +556,22 @@ def video_feeder():
         with frame_lock:
             frame = _last_frame; lm = _last_frame_mono; fin = _frames_in
         age_ms = None if lm is None else (time.monotonic() - lm) * 1000.0
-        if frame is None:
+        if not _enabled.is_set():
+            frame = IDLE_FRAME; conn = "off"
+        elif frame is None:
             frame = IDLE_FRAME; conn = "waiting"
         elif age_ms is not None and age_ms > FREEZE_TIMEOUT_MS:
             conn = "frozen"
         else:
             conn = "connected"
+        if conn != last_conn:
+            # Transition d'état = l'événement qui justifie une coupure. Horodatée, avec le
+            # format de la source au moment du raccrochage.
+            journal("state", state=conn, prev=last_conn,
+                    source=_input_url().split("?", 1)[0],
+                    src_fmt=(_src_fmt.get("video") or None),
+                    frame_age_ms=(None if age_ms is None else round(age_ms)))
+            last_conn = conn
         _write_video(shm, frame, kf); idx += 1
         now = _grid_now_ns()
         gap = now - last_w; last_w = now
@@ -508,15 +675,42 @@ def audio_feeder():
         time.sleep(0.0005)
 
 # ─── HTTP : :8080 metrics + :8082 control ────────────────────────────────────
+_SRC_INT = ("listen_port", "srt_latency_ms")
+_SRC_STR = ("url", "srt_passphrase", "srt_streamid", "rtmp_app", "rtmp_key")
+
+def _apply_source(body):
+    """Applique un nouveau point d'entrée à chaud. Renvoie les clés effectivement changées."""
+    changed = []
+    with src_lock:
+        for k in _SRC_INT:
+            if k in body:
+                try: v = int(body[k])
+                except (TypeError, ValueError): continue
+                if v != _src[k]: _src[k] = v; changed.append(k)
+        for k in _SRC_STR:
+            if k in body:
+                v = str(body[k] or "")
+                if k in ("rtmp_app", "rtmp_key"): v = v.strip("/")
+                if k == "rtmp_app" and not v: v = "live"
+                if v != _src[k]: _src[k] = v; changed.append(k)
+    if changed:
+        journal("source_change", changed=changed, source=_input_url().split("?", 1)[0])
+        _reconnect_req.set()          # relance ffmpeg sur la nouvelle adresse
+    return changed
+
 def _state_payload():
     with metrics_lock: m = dict(metrics)
-    m.update({{"video_shm": VIDEO_SHM, "audio_shm": AUDIO_SHM,
+    with src_lock: s = dict(_src)
+    with _hist_lock: hist = list(_hist)
+    m.update(s)
+    m.update({{"hostname": HOSTNAME, "video_shm": VIDEO_SHM, "audio_shm": AUDIO_SHM,
               "width": WIDTH, "height": HEIGHT, "fps_cfg": FPS,
               "chroma": CHROMA, "bit_depth": BIT_DEPTH, "scan": _SCAN_CFG,
-              "mode": MODE, "url": URL, "listen_port": LISTEN_PORT,
-              "rtmp_app": RTMP_APP, "rtmp_key": RTMP_KEY,
-              "idle_mode": IDLE_MODE, "freeze_timeout_ms": FREEZE_TIMEOUT_MS,
-              "genlock": GENLOCK, "last_errors": list(_stderr_tail)}})
+              "mode": MODE, "idle_mode": IDLE_MODE,
+              "freeze_timeout_ms": FREEZE_TIMEOUT_MS, "genlock": GENLOCK,
+              "source_format": dict(_src_fmt),
+              "history": hist, "history_seconds": HIST_SECONDS,
+              "last_errors": list(_stderr_tail)}})
     return m
 
 class MetricsHandler(BaseHTTPRequestHandler):
@@ -537,14 +731,48 @@ class ControlHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
     def do_GET(self):
-        if self.path == "/state":
+        path, _, qs = self.path.partition("?")
+        if path == "/state":
             self._send_json(200, _state_payload())
+        elif path == "/events":
+            q = urllib.parse.parse_qs(qs)
+            def _num(k):
+                try: return float(q[k][0])
+                except Exception: return None
+            try: limit = int(q.get("limit", ["5000"])[0])
+            except Exception: limit = 5000
+            evs = journal_read(_num("from"), _num("to"), max(1, min(50000, limit)))
+            self._send_json(200, {{"events": evs, "count": len(evs),
+                                  "hostname": HOSTNAME, "mode": MODE}})
         else:
             self.send_response(404); self.end_headers()
+    def _body(self):
+        n = int(self.headers.get("Content-Length", 0))
+        try: return json.loads(self.rfile.read(n)) if n else {{}}
+        except Exception: return None
     def do_POST(self):
         if self.path == "/reconnect":
             _reconnect_req_audio.set()
             _reconnect_req.set()
+            self._send_json(200, {{"ok": True}})
+        elif self.path == "/source":
+            body = self._body()
+            if body is None:
+                self._send_json(400, {{"error": "JSON invalide"}}); return
+            self._send_json(200, {{"ok": True, "applied": _apply_source(body)}})
+        elif self.path == "/enable":
+            body = self._body()
+            if body is None:
+                self._send_json(400, {{"error": "JSON invalide"}}); return
+            want = _as_bool(body.get("enabled"), default=True)
+            if want: _enabled.set()
+            else:    _enabled.clear()
+            with metrics_lock:
+                metrics["enabled"] = want
+            journal("power", enabled=want)
+            self._send_json(200, {{"ok": True, "enabled": want}})
+        elif self.path == "/events/clear":
+            journal_clear()
             self._send_json(200, {{"ok": True}})
         else:
             self.send_response(404); self.end_headers()
@@ -557,10 +785,14 @@ try:
 except Exception:
     pass
 
+journal("script_start", version=PLUGIN_VERSION, mode=MODE, enabled=ENABLED,
+        out_format="%dx%d%s%d" % (WIDTH, HEIGHT, _SCAN_CFG, FPS))
+
 threading.Thread(target=lambda: HTTPServer(("0.0.0.0", 8080), MetricsHandler).serve_forever(), daemon=True).start()
 threading.Thread(target=lambda: HTTPServer(("0.0.0.0", 8082), ControlHandler).serve_forever(), daemon=True).start()
 threading.Thread(target=_audio_reader, daemon=True).start()
 threading.Thread(target=supervisor, daemon=True).start()
+threading.Thread(target=history_sampler, daemon=True).start()
 threading.Thread(target=video_feeder, daemon=True).start()
 threading.Thread(target=audio_feeder, daemon=True).start()
 
