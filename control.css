@@ -1,0 +1,31 @@
+/* UI de contrôle embarquée du plugin Stream In (montée dans le shell Sources).
+   Styles de l'éditeur uniquement (la sidebar/liste appartient au shell). */
+.si-wrap { display:flex; flex-direction:column; gap:12px; }
+
+.si-head { display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+    padding-bottom:8px; border-bottom:1px solid var(--border-soft); }
+.si-badge { font-size:0.72em; font-weight:700; letter-spacing:0.04em; text-transform:uppercase;
+    padding:3px 7px; border-radius:4px; background:var(--accent-soft); color:var(--accent); }
+.si-state { font-size:0.8em; font-weight:700; padding:3px 9px; border-radius:12px; }
+.si-state.waiting   { background:var(--bg-input); color:var(--text-muted); }
+.si-state.connected { background:rgba(46,160,67,0.18); color:#3fb950; }
+.si-state.frozen    { background:rgba(210,153,34,0.18); color:#d29922; }
+.si-meta { color:var(--text-muted); font-size:0.85em; }
+.si-spacer { flex:1; min-width:8px; }
+
+.si-card { display:flex; flex-direction:column; gap:8px; padding:10px 12px;
+    background:var(--bg-input); border:1px solid var(--border-soft); border-radius:6px; }
+.si-card-title { font-weight:600; font-size:0.9em; }
+.si-url-row { display:flex; align-items:center; gap:8px; }
+.si-url { flex:1; font-family:var(--font-mono); font-size:0.9em; padding:6px 9px;
+    background:var(--bg); border:1px solid var(--border-soft); border-radius:4px;
+    overflow-x:auto; white-space:nowrap; user-select:all; }
+.si-hint { color:var(--text-muted); font-size:0.8em; }
+
+.si-stats { display:flex; gap:18px; flex-wrap:wrap; }
+.si-stat b { font-family:var(--font-mono); }
+.si-stat span { color:var(--text-muted); font-size:0.82em; }
+
+.si-errors { font-family:var(--font-mono); font-size:0.78em; color:var(--text-muted);
+    max-height:110px; overflow-y:auto; white-space:pre-wrap; }
+.si-error { color:#f85149; }

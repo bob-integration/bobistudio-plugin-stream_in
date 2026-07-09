@@ -1,0 +1,220 @@
+{
+  "type": "stream_in",
+  "label": "Stream In",
+  "runtime": "docker",
+  "image": "media",
+  "version": "0.1.0",
+  "script_template": "script.py",
+  "ui": {
+    "control_html": "control.html",
+    "control_js": "control.js",
+    "control_css": "control.css"
+  },
+  "nav": {
+    "section": "sources",
+    "label": "Sources",
+    "order": 20
+  },
+  "resources": {
+    "cores": 2,
+    "memory": 1024,
+    "pin": true
+  },
+  "deploy_defaults": {
+    "mode": "srt_listener",
+    "url": "",
+    "listen_port": 9000,
+    "srt_latency_ms": 200,
+    "srt_passphrase": "",
+    "srt_streamid": "",
+    "rtmp_app": "live",
+    "rtmp_key": "",
+    "ingest_network": "",
+    "width": 1920,
+    "height": 1080,
+    "fps": 50,
+    "chroma": "422",
+    "bit_depth": 8,
+    "scan": "p",
+    "field_order": "tff",
+    "genlock": true,
+    "genlock_phase_ms": 0.0,
+    "idle_mode": "bars",
+    "freeze_timeout_ms": 1000
+  },
+  "config_schema": [
+    {
+      "key": "mode",
+      "type": "select",
+      "label": "Mode d'ingest",
+      "default": "srt_listener",
+      "options": [
+        {"value": "srt_listener", "label": "SRT — écoute (la source pousse)"},
+        {"value": "srt_caller", "label": "SRT — appel (on tire une source distante)"},
+        {"value": "rtmp_server", "label": "RTMP — serveur (push OBS/encodeur)"},
+        {"value": "rtmp_pull", "label": "RTMP — pull (flux distant)"}
+      ],
+      "scope": "system"
+    },
+    {
+      "key": "url",
+      "type": "text",
+      "label": "URL distante",
+      "placeholder": "srt://hôte:port ou rtmp://hôte/app/clé",
+      "visible_if": {"mode": ["srt_caller", "rtmp_pull"]},
+      "scope": "system"
+    },
+    {
+      "key": "listen_port",
+      "type": "number",
+      "label": "Port d'écoute",
+      "min": 1024,
+      "max": 65535,
+      "default": 9000,
+      "visible_if": {"mode": ["srt_listener", "rtmp_server"]},
+      "scope": "system"
+    },
+    {
+      "key": "srt_latency_ms",
+      "type": "number",
+      "label": "Latence SRT (ms)",
+      "min": 20,
+      "max": 8000,
+      "default": 200,
+      "visible_if": {"mode": ["srt_listener", "srt_caller"]},
+      "scope": "system"
+    },
+    {
+      "key": "srt_passphrase",
+      "type": "text",
+      "label": "Passphrase SRT (optionnelle)",
+      "visible_if": {"mode": ["srt_listener", "srt_caller"]},
+      "scope": "system"
+    },
+    {
+      "key": "srt_streamid",
+      "type": "text",
+      "label": "Stream ID SRT (optionnel)",
+      "visible_if": {"mode": ["srt_listener", "srt_caller"]},
+      "scope": "system"
+    },
+    {
+      "key": "rtmp_app",
+      "type": "text",
+      "label": "Application RTMP",
+      "default": "live",
+      "visible_if": {"mode": "rtmp_server"},
+      "scope": "system"
+    },
+    {
+      "key": "rtmp_key",
+      "type": "text",
+      "label": "Clé de flux RTMP (vide = stream)",
+      "visible_if": {"mode": "rtmp_server"},
+      "scope": "system"
+    },
+    {
+      "key": "width",
+      "type": "number",
+      "label": "Largeur sortie (px)",
+      "min": 320,
+      "max": 3840,
+      "step": 2,
+      "default": 1920,
+      "scope": "system"
+    },
+    {
+      "key": "height",
+      "type": "number",
+      "label": "Hauteur sortie (px)",
+      "min": 180,
+      "max": 2160,
+      "step": 2,
+      "default": 1080,
+      "scope": "system"
+    },
+    {
+      "key": "fps",
+      "type": "number",
+      "label": "Cadence sortie (fps)",
+      "min": 1,
+      "max": 60,
+      "default": 50,
+      "scope": "system"
+    },
+    {
+      "key": "chroma",
+      "type": "select",
+      "label": "Chroma sortie",
+      "default": "422",
+      "options": [
+        {"value": "420", "label": "YUV 4:2:0"},
+        {"value": "422", "label": "YUV 4:2:2"},
+        {"value": "444", "label": "YUV 4:4:4"}
+      ],
+      "scope": "system"
+    },
+    {
+      "key": "bit_depth",
+      "type": "select",
+      "label": "Profondeur sortie",
+      "default": "8",
+      "options": [
+        {"value": "8", "label": "8 bits"},
+        {"value": "10", "label": "10 bits"}
+      ],
+      "scope": "system"
+    },
+    {
+      "key": "scan",
+      "type": "select",
+      "label": "Balayage sortie",
+      "default": "p",
+      "options": [
+        {"value": "p", "label": "Progressif"},
+        {"value": "i", "label": "Entrelacé"}
+      ],
+      "scope": "system"
+    },
+    {
+      "key": "idle_mode",
+      "type": "select",
+      "label": "Image sans flux",
+      "default": "bars",
+      "options": [
+        {"value": "bars", "label": "Mire (barres)"},
+        {"value": "black", "label": "Noir"}
+      ],
+      "scope": "user"
+    },
+    {
+      "key": "freeze_timeout_ms",
+      "type": "number",
+      "label": "Seuil de gel (ms)",
+      "min": 100,
+      "max": 30000,
+      "default": 1000,
+      "scope": "user"
+    },
+    {
+      "key": "genlock",
+      "type": "checkbox",
+      "label": "Genlock (grille PTP)",
+      "default": true,
+      "scope": "system"
+    }
+  ],
+  "wiring": {
+    "produces": [
+      {"essence": "video", "shm": "{hostname}"},
+      {"essence": "audio", "shm": "{hostname}_audio"}
+    ],
+    "consumes": [],
+    "mode": "redeploy"
+  },
+  "control": {
+    "port": 8082,
+    "endpoints": ["/state", "/reconnect"],
+    "read_endpoints": ["/state"]
+  }
+}

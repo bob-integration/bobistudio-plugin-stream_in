@@ -1,0 +1,14 @@
+{
+  "version": "0.1.0",
+  "date": "2026-07-09",
+  "changes": {
+    "Première version (0.1.0)": [
+      "Source réseau SRT/RTMP → bus MXL : 4 modes d'ingest (SRT écoute, SRT appel, RTMP serveur, RTMP pull) via ffmpeg.",
+      "Sortie CONFORMÉE au format configuré (résolution, cadence, chroma, profondeur, balayage) : scale + fps + désentrelacement bwdif — le flux entrant n'a jamais besoin d'être au bon format.",
+      "Feeder genlock maître (grille PTP/TAI, modèle player) : signal MXL continu dans tous les états — mire/noir en attente de flux, freeze de la dernière image si le flux gèle (seuil configurable), y compris pendant les redémarrages ffmpeg.",
+      "Audio décodé en float32 48 kHz 8 canaux vers un flux MXL AudioWriter (silence cadencé si absent) ; bascule automatique en vidéo seule si le flux n'a pas de piste audio.",
+      "Superviseur ffmpeg : redémarrage auto avec backoff, stall-kill des connexions zombies en modes appel/pull, derniers messages d'erreur exposés sur /state.",
+      "UI de contrôle : état de connexion, fps entrée/sortie, URL d'ingest à copier (IP macvlan du conteneur), bouton Reconnecter."
+    ]
+  }
+}
