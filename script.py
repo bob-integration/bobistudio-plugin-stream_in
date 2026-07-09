@@ -149,7 +149,21 @@ _hist_lock = threading.Lock()
 # faut une trace horodatée qui survit au redémarrage du script. JSONL append-only, tourné à
 # JOURNAL_MAX_BYTES. Horloge murale (CLOCK_REALTIME, disciplinée PTP) : les horodatages sont
 # comparables avec ceux des autres équipements de la chaîne.
-JOURNAL_PATH = "/opt/script/stream_in_events.jsonl"
+# /var/lib/bobi = volume d'état persistant du nœud (manifest state_volume). Le rootfs du
+# conteneur est RECRÉÉ à chaque déploiement et au boot du nœud : un journal écrit dans
+# /opt/script disparaîtrait précisément quand il sert, après une coupure. Repli sur /opt/script
+# si le volume n'est pas monté (container créé avant l'ajout de state_volume).
+def _journal_path():
+    d = "/var/lib/bobi"
+    try:
+        if os.path.isdir(d) and os.access(d, os.W_OK):
+            return os.path.join(d, "stream_in_events.jsonl")
+    except Exception:
+        pass
+    return "/opt/script/stream_in_events.jsonl"
+
+JOURNAL_PATH = _journal_path()
+JOURNAL_PERSISTENT = JOURNAL_PATH.startswith("/var/lib/bobi")
 JOURNAL_MAX_BYTES = 4 * 1024 * 1024
 _journal_lock = threading.Lock()
 
@@ -709,6 +723,7 @@ def _state_payload():
               "mode": MODE, "idle_mode": IDLE_MODE,
               "freeze_timeout_ms": FREEZE_TIMEOUT_MS, "genlock": GENLOCK,
               "source_format": dict(_src_fmt),
+              "journal_persistent": JOURNAL_PERSISTENT,
               "history": hist, "history_seconds": HIST_SECONDS,
               "last_errors": list(_stderr_tail)}})
     return m

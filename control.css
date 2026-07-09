@@ -170,3 +170,5 @@
 
 .si-btn.danger { color: var(--text-muted); }
 .si-btn.danger:hover { color: var(--status-stopped-fg); border-color: var(--status-stopped-fg); }
+
+.si-warn { color: var(--status-warning-fg); font-size: 0.78em; line-height: 1.5; max-width: 68ch; }

@@ -410,6 +410,8 @@ window.MXLPlugins.stream_in = (function () {
               <button class="si-btn si-jrn-clear danger">${esc(t('plugin.stream_in.jrn_clear'))}</button>
             </div>
             <p class="si-hint">${esc(t('plugin.stream_in.jrn_hint'))}</p>
+            ${state && state.journal_persistent === false
+                ? `<p class="si-warn">⚠ ${esc(t('plugin.stream_in.jrn_volatile'))}</p>` : ''}
             <div class="si-jrn-out"></div>
           </div>
         </details>`;

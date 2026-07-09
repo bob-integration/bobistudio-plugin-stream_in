@@ -1,7 +1,12 @@
 {
-  "version": "0.2.1",
+  "version": "0.2.2",
   "date": "2026-07-09",
   "changes": {
+    "Journal persistant sur volume d'état (0.2.2)": [
+      "Le rootfs d'un conteneur est RECRÉÉ à chaque déploiement et au boot du nœud : le journal écrit dans /opt/script disparaissait précisément quand il sert, après une coupure. Vérifié sur banc : après un reboot de nœud, il ne restait aucun événement antérieur.",
+      "Nouveau `state_volume` déclaratif dans le manifeste (calqué sur `media_volume`) : le conteneur reçoit un dossier persistant du nœud, /var/lib/bobi/state/<hostname> → /var/lib/bobi. Le journal s'y écrit, avec repli sur /opt/script. Vérifié : 8 événements antérieurs conservés à travers une recréation de conteneur.",
+      "Le panneau avertit explicitement quand le journal n'est PAS persistant (conteneur créé avant l'ajout du volume) : la promesse de pièce justificative ne doit jamais être fausse en silence."
+    ],
     "Refonte de l'interface + journal de connexion (0.2.0 → 0.2.1)": [
       "Formulaire ⚙ ramené de 17 champs à 7 : le format de sortie vient désormais du sélecteur universel de la palette (alimenté par Réglages → Formats vidéo) au lieu d'être redéclaré, et l'adresse quitte le formulaire.",
       "Point d'entrée éditable EN PLACE : l'adresse affichée est l'adresse réglable (port, application et clé RTMP, ou URL distante). Appliquée à chaud via le hook control_action, sans redéployer ni couper la sortie MXL. Une seule vérité.",
