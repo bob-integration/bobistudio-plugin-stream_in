@@ -38,6 +38,20 @@ que soit ce qu'envoie la source. Pour une sortie entrelacée (ex. 1080i50) : cad
 L'audio du flux est décodé vers un shm 8 canaux 48 kHz (câblable page Câbles). Sans piste
 audio dans le flux, l'instance bascule automatiquement en vidéo seule (silence sur le shm).
 
+## Diagnostic audio
+
+`:8080` expose la santé du chemin audio — en régime établi, les trois compteurs doivent rester
+figés :
+
+- `audio_buf_ms` : occupation du tampon = **latence de l'audio par rapport à la vidéo**
+  (40–60 ms attendus). Une valeur qui monte et reste haute = audio en retard.
+- `audio_starve_blocks` : blocs de silence insérés faute d'audio frais (s'incrémente pendant
+  l'attente d'une source, c'est normal).
+- `audio_drop_samples` : échantillons jetés pour ramener la latence à la cible (une salve au
+  démarrage est normale).
+- `audio_reanchors` : ré-ancrages sur la grille TAI (dérive > 250 ms de l'horloge source).
+- `audio_in_sps` : échantillons/s livrés par ffmpeg (≈ 48000).
+
 ## Contrôle
 
 - `GET /state` : état complet (connexion, fps entrée/sortie, âge de la dernière image,

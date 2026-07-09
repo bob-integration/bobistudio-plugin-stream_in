@@ -1,10 +1,12 @@
 {
-  "version": "0.1.1",
+  "version": "0.1.5",
   "date": "2026-07-09",
   "changes": {
-    "Audio : clics/bruit corrigés (0.1.1)": [
-      "L'audio sortait haché (~220 discontinuités/s, mesurées dans le flux MXL) : `AudioWriter.write()` sans index explicite recalcule `mxlGetCurrentIndex() - n` à chaque appel, si bien que deux écritures rapprochées retombaient sur le même index (écrasement) ou en sautaient (les vieux échantillons du ring ressortaient). Le feeder ancre désormais une fois sur la grille d'échantillons TAI et écrit à un index strictement contigu (blocs de 5 ms), avec ré-ancrage unique si la dérive dépasse 250 ms.",
-      "Branche audio ffmpeg : ajout de `aresample=async=1` — la source réseau a sa propre horloge (PTS qui sautent), ffmpeg produit maintenant un 48 kHz réellement continu."
+    "Audio : clics, bruit et désynchronisation corrigés (0.1.1 → 0.1.5)": [
+      "Clics/bruit : `AudioWriter.write()` sans index explicite recalcule `mxlGetCurrentIndex() - n` à chaque appel — deux écritures rapprochées retombaient sur le même index (écrasement) ou en sautaient (les vieux échantillons du ring ressortaient). ~220 discontinuités/s mesurées dans le flux MXL. Le feeder ancre désormais une fois sur la grille d'échantillons TAI et écrit à un index strictement contigu (blocs de 5 ms).",
+      "Désynchronisation : l'entrée et la sortie tournant toutes deux à 48 kHz, le tampon ne se vide jamais de lui-même et gardait le retard déposé par la rafale de démarrage de ffmpeg (~190 ms d'audio en retard sur la vidéo). Capacité (200 ms, absorbe les rafales) et latence visée (30 ms) sont désormais distinctes : au-delà de 60 ms d'occupation, on draine d'un coup jusqu'à la cible. Latence mesurée en régime établi : 40–60 ms, sans drop ni famine.",
+      "Branche audio ffmpeg : `aresample=async=1` (l'horloge de la source réseau n'est pas la grille TAI) et `-flush_packets 1` (sans lui ffmpeg vidait le fifo par rafales plus grosses que la latence visée, provoquant écrêtage puis famine).",
+      "Observabilité : `:8080` expose `audio_buf_ms` (= latence audio), `audio_starve_blocks`, `audio_drop_samples`, `audio_reanchors` et `audio_in_sps`."
     ],
     "Première version (0.1.0)": [
       "Source réseau SRT/RTMP → bus MXL : 4 modes d'ingest (SRT écoute, SRT appel, RTMP serveur, RTMP pull) via ffmpeg.",

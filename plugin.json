@@ -3,7 +3,7 @@
   "label": "Stream In",
   "runtime": "docker",
   "image": "media",
-  "version": "0.1.1",
+  "version": "0.1.5",
   "script_template": "script.py",
   "ui": {
     "control_html": "control.html",
@@ -49,10 +49,22 @@
       "label": "Mode d'ingest",
       "default": "srt_listener",
       "options": [
-        {"value": "srt_listener", "label": "SRT — écoute (la source pousse)"},
-        {"value": "srt_caller", "label": "SRT — appel (on tire une source distante)"},
-        {"value": "rtmp_server", "label": "RTMP — serveur (push OBS/encodeur)"},
-        {"value": "rtmp_pull", "label": "RTMP — pull (flux distant)"}
+        {
+          "value": "srt_listener",
+          "label": "SRT — écoute (la source pousse)"
+        },
+        {
+          "value": "srt_caller",
+          "label": "SRT — appel (on tire une source distante)"
+        },
+        {
+          "value": "rtmp_server",
+          "label": "RTMP — serveur (push OBS/encodeur)"
+        },
+        {
+          "value": "rtmp_pull",
+          "label": "RTMP — pull (flux distant)"
+        }
       ],
       "scope": "system"
     },
@@ -61,7 +73,12 @@
       "type": "text",
       "label": "URL distante",
       "placeholder": "srt://hôte:port ou rtmp://hôte/app/clé",
-      "visible_if": {"mode": ["srt_caller", "rtmp_pull"]},
+      "visible_if": {
+        "mode": [
+          "srt_caller",
+          "rtmp_pull"
+        ]
+      },
       "scope": "system"
     },
     {
@@ -71,7 +88,12 @@
       "min": 1024,
       "max": 65535,
       "default": 9000,
-      "visible_if": {"mode": ["srt_listener", "rtmp_server"]},
+      "visible_if": {
+        "mode": [
+          "srt_listener",
+          "rtmp_server"
+        ]
+      },
       "scope": "system"
     },
     {
@@ -81,21 +103,36 @@
       "min": 20,
       "max": 8000,
       "default": 200,
-      "visible_if": {"mode": ["srt_listener", "srt_caller"]},
+      "visible_if": {
+        "mode": [
+          "srt_listener",
+          "srt_caller"
+        ]
+      },
       "scope": "system"
     },
     {
       "key": "srt_passphrase",
       "type": "text",
       "label": "Passphrase SRT (optionnelle)",
-      "visible_if": {"mode": ["srt_listener", "srt_caller"]},
+      "visible_if": {
+        "mode": [
+          "srt_listener",
+          "srt_caller"
+        ]
+      },
       "scope": "system"
     },
     {
       "key": "srt_streamid",
       "type": "text",
       "label": "Stream ID SRT (optionnel)",
-      "visible_if": {"mode": ["srt_listener", "srt_caller"]},
+      "visible_if": {
+        "mode": [
+          "srt_listener",
+          "srt_caller"
+        ]
+      },
       "scope": "system"
     },
     {
@@ -103,14 +140,18 @@
       "type": "text",
       "label": "Application RTMP",
       "default": "live",
-      "visible_if": {"mode": "rtmp_server"},
+      "visible_if": {
+        "mode": "rtmp_server"
+      },
       "scope": "system"
     },
     {
       "key": "rtmp_key",
       "type": "text",
       "label": "Clé de flux RTMP (vide = stream)",
-      "visible_if": {"mode": "rtmp_server"},
+      "visible_if": {
+        "mode": "rtmp_server"
+      },
       "scope": "system"
     },
     {
@@ -148,9 +189,18 @@
       "label": "Chroma sortie",
       "default": "422",
       "options": [
-        {"value": "420", "label": "YUV 4:2:0"},
-        {"value": "422", "label": "YUV 4:2:2"},
-        {"value": "444", "label": "YUV 4:4:4"}
+        {
+          "value": "420",
+          "label": "YUV 4:2:0"
+        },
+        {
+          "value": "422",
+          "label": "YUV 4:2:2"
+        },
+        {
+          "value": "444",
+          "label": "YUV 4:4:4"
+        }
       ],
       "scope": "system"
     },
@@ -160,8 +210,14 @@
       "label": "Profondeur sortie",
       "default": "8",
       "options": [
-        {"value": "8", "label": "8 bits"},
-        {"value": "10", "label": "10 bits"}
+        {
+          "value": "8",
+          "label": "8 bits"
+        },
+        {
+          "value": "10",
+          "label": "10 bits"
+        }
       ],
       "scope": "system"
     },
@@ -171,8 +227,14 @@
       "label": "Balayage sortie",
       "default": "p",
       "options": [
-        {"value": "p", "label": "Progressif"},
-        {"value": "i", "label": "Entrelacé"}
+        {
+          "value": "p",
+          "label": "Progressif"
+        },
+        {
+          "value": "i",
+          "label": "Entrelacé"
+        }
       ],
       "scope": "system"
     },
@@ -182,8 +244,14 @@
       "label": "Image sans flux",
       "default": "bars",
       "options": [
-        {"value": "bars", "label": "Mire (barres)"},
-        {"value": "black", "label": "Noir"}
+        {
+          "value": "bars",
+          "label": "Mire (barres)"
+        },
+        {
+          "value": "black",
+          "label": "Noir"
+        }
       ],
       "scope": "user"
     },
@@ -206,15 +274,26 @@
   ],
   "wiring": {
     "produces": [
-      {"essence": "video", "shm": "{hostname}"},
-      {"essence": "audio", "shm": "{hostname}_audio"}
+      {
+        "essence": "video",
+        "shm": "{hostname}"
+      },
+      {
+        "essence": "audio",
+        "shm": "{hostname}_audio"
+      }
     ],
     "consumes": [],
     "mode": "redeploy"
   },
   "control": {
     "port": 8082,
-    "endpoints": ["/state", "/reconnect"],
-    "read_endpoints": ["/state"]
+    "endpoints": [
+      "/state",
+      "/reconnect"
+    ],
+    "read_endpoints": [
+      "/state"
+    ]
   }
 }

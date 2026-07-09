@@ -90,7 +90,11 @@ metrics_lock = threading.Lock()
 metrics = {{"fps": 0.0, "frame_index": 0, "plugin_version": PLUGIN_VERSION,
            "conn_state": "waiting", "mode": MODE, "listen_port": LISTEN_PORT,
            "last_frame_age_ms": None, "ffmpeg_restarts": 0, "video_max_gap_ms": 0.0,
-           "in_fps": 0.0}}
+           "in_fps": 0.0,
+           # Santé du chemin audio : famine (silence inséré), drop (buffer saturé) et
+           # ré-ancrage (dérive horloge source ↔ grille TAI) — tous trois s'entendent.
+           "audio_starve_blocks": 0, "audio_drop_samples": 0, "audio_reanchors": 0,
+           "audio_buf_ms": 0.0, "audio_in_sps": 0.0}}
 
 frame_lock = threading.Lock()
 _last_frame = None            # bytes de la dernière trame conformée reçue
@@ -98,8 +102,20 @@ _last_frame_mono = None       # time.monotonic() de réception
 _frames_in = 0                # compteur trames reçues (fenêtre in_fps)
 
 audio_lock = threading.Lock()
-_audio_buf = collections.deque()   # blocs float32 (n, 8) en attente, borné ~200 ms
-_AUDIO_BUF_MAX = A_SAMPLE_RATE // 5
+_audio_buf = collections.deque()   # blocs float32 (n, 8) en attente
+_audio_buf_n = 0                   # échantillons dans _audio_buf (compteur, évite un sum() par chunk)
+# Capacité et latence sont DEUX choses distinctes. On entre et on sort à 48 kHz, donc le tampon ne
+# se vide jamais de lui-même : son occupation en régime établi EST la latence audio (retard sur la
+# vidéo). Mais ffmpeg écrit dans le fifo par rafales de plusieurs dizaines de ms : un plafond bas
+# écrête ces rafales (drops) puis affame le feeder — il faut donc de la capacité ET un drainage.
+#   MAX  : capacité dure, absorbe les rafales d'écriture de ffmpeg.
+#   HIGH : au-delà, on draine jusqu'à TARGET — une fois (rafale de démarrage), pas à chaque pic.
+# L'occupation mesurée n'oscille que de ~20 ms : HIGH−TARGET = 30 ms suffit à ne jamais déclencher
+# le drainage en régime établi, tout en gardant la latence audio à ~2 trames.
+_AUDIO_BUF_MAX    = A_SAMPLE_RATE * 200 // 1000
+_AUDIO_BUF_HIGH   = A_SAMPLE_RATE *  60 // 1000
+_AUDIO_BUF_TARGET = A_SAMPLE_RATE *  30 // 1000
+_audio_seen = False                # a-t-on déjà reçu de l'audio ? (sinon la famine est normale)
 
 _proc = None                  # process ffmpeg courant (supervisé)
 _proc_lock = threading.Lock()
@@ -223,9 +239,11 @@ def _ffmpeg_cmd(with_audio=True):
         # fait échouer ffmpeg au démarrage → le superviseur retombe en vidéo seule (cf. bascule).
         # aresample=async : la source réseau a sa propre horloge (PTS qui sautent, jitter) —
         # ffmpeg comble/compresse pour sortir un flux réellement continu à 48 kHz.
+        # flush_packets : sans lui, ffmpeg accumule dans son tampon AVIO et vide le fifo par
+        # rafales plus grosses que la latence visée → écrêtage puis famine côté feeder.
         cmd += ["-map", "0:a:0?", "-af", "aresample=async=1:first_pts=0",
                 "-ac", str(A_CHANNELS), "-ar", str(A_SAMPLE_RATE),
-                "-f", "f32le", "-y", AUDIO_FIFO]
+                "-f", "f32le", "-flush_packets", "1", "-y", AUDIO_FIFO]
     return cmd
 
 # ─── lecteurs de sortie ffmpeg (ne bloquent jamais le feeder) ────────────────
@@ -248,10 +266,16 @@ def _video_reader(proc):
                 _last_frame_mono = time.monotonic()
                 _frames_in += 1
 
+def _audio_seen_set():
+    global _audio_seen
+    _audio_seen = True
+
 def _audio_reader():
     """Ouvre le fifo audio en boucle (rendez-vous bloquant OK : thread dédié, jamais sur le chemin
     vidéo). Blocs f32le 8ch → deque bornée consommée par audio_feeder."""
+    global _audio_buf_n
     blk = A_SPMS * A_CHANNELS * 4 * 10          # 10 ms
+    win_n = 0; win_t0 = time.monotonic()
     while True:
         try:
             with open(AUDIO_FIFO, "rb") as f:
@@ -263,11 +287,24 @@ def _audio_reader():
                     if n <= 0: continue
                     arr = np.frombuffer(data, dtype=np.float32,
                                         count=n * A_CHANNELS).reshape(n, A_CHANNELS)
+                    _audio_seen_set()
+                    dropped = 0
                     with audio_lock:
-                        _audio_buf.append(arr)
-                        tot = sum(a.shape[0] for a in _audio_buf)
-                        while tot > _AUDIO_BUF_MAX and _audio_buf:
-                            tot -= _audio_buf.popleft().shape[0]
+                        _audio_buf.append(arr); _audio_buf_n += n
+                        while _audio_buf_n > _AUDIO_BUF_MAX and _audio_buf:
+                            d = _audio_buf.popleft().shape[0]
+                            _audio_buf_n -= d; dropped += d
+                        tot = _audio_buf_n
+                    win_n += n
+                    el = time.monotonic() - win_t0
+                    with metrics_lock:
+                        if dropped:
+                            metrics["audio_drop_samples"] += dropped
+                        metrics["audio_buf_ms"] = round(tot / float(A_SPMS), 1)
+                        if el >= 1.0:
+                            metrics["audio_in_sps"] = round(win_n / el)
+                    if el >= 1.0:
+                        win_n = 0; win_t0 = time.monotonic()
         except Exception:
             time.sleep(0.5)
 
@@ -401,6 +438,7 @@ def _tai_sample_index():
     return bobimxl.now_tai() * A_SAMPLE_RATE // 1_000_000_000
 
 def audio_feeder():
+    global _audio_buf_n
     aw = bobimxl.AudioWriter(inst, AUDIO_SHM, channels=A_CHANNELS, sample_rate=A_SAMPLE_RATE,
                              index_mode="free")   # l'index est fourni explicitement à write()
     silence = np.zeros((A_BLK, A_CHANNELS), dtype=np.float32)
@@ -408,14 +446,29 @@ def audio_feeder():
     next_idx = _tai_sample_index() - A_BLK
     while True:
         cur = _tai_sample_index()
+        # Drainage : l'occupation du tampon est la latence audio. Au-delà du seuil haut (rafale
+        # de démarrage, hoquet réseau) on retombe d'un coup sur la cible plutôt que de traîner
+        # ce retard indéfiniment. Les pics normaux (< HIGH) ne déclenchent rien : pas de thrash.
+        drained = 0
+        with audio_lock:
+            if _audio_buf_n > _AUDIO_BUF_HIGH:
+                while _audio_buf_n > _AUDIO_BUF_TARGET and _audio_buf:
+                    d = _audio_buf.popleft().shape[0]
+                    _audio_buf_n -= d; drained += d
+                pending = None
+        if drained:
+            with metrics_lock:
+                metrics["audio_drop_samples"] += drained
         # Dérive : l'horloge de la SOURCE n'est pas la grille TAI. Trop en retard (backlog) ou
         # trop en avance (écriture dans le futur) → on ré-ancre, un seul saut plutôt qu'un
         # décalage qui s'accumule.
         if abs(cur - next_idx) > A_MAX_LAG:
             next_idx = cur - A_BLK
             with audio_lock:
-                _audio_buf.clear()
+                _audio_buf.clear(); _audio_buf_n = 0
             pending = None
+            with metrics_lock:
+                metrics["audio_reanchors"] += 1
         while next_idx + A_BLK <= cur:
             need = A_BLK
             out = np.empty((A_BLK, A_CHANNELS), dtype=np.float32); pos = 0
@@ -428,6 +481,7 @@ def audio_feeder():
                         pos += take; need -= take
                     elif _audio_buf:
                         pending = _audio_buf.popleft()
+                        _audio_buf_n -= pending.shape[0]
                     else:
                         break
             if need > 0:                  # pas assez de frais → compléter en silence
@@ -435,6 +489,9 @@ def audio_feeder():
                     out = silence
                 else:
                     out[pos:] = 0.0
+                if _audio_seen:          # avant le 1er échantillon, le silence est normal
+                    with metrics_lock:
+                        metrics["audio_starve_blocks"] += 1
             try: aw.write(out, index=next_idx)
             except Exception: pass
             next_idx += A_BLK
