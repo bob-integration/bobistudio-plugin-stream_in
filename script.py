@@ -221,7 +221,10 @@ def _ffmpeg_cmd(with_audio=True):
     if with_audio:
         # `0:a:0?` tolère l'absence de piste au niveau du mapping, mais une sortie SANS stream
         # fait échouer ffmpeg au démarrage → le superviseur retombe en vidéo seule (cf. bascule).
-        cmd += ["-map", "0:a:0?", "-ac", str(A_CHANNELS), "-ar", str(A_SAMPLE_RATE),
+        # aresample=async : la source réseau a sa propre horloge (PTS qui sautent, jitter) —
+        # ffmpeg comble/compresse pour sortir un flux réellement continu à 48 kHz.
+        cmd += ["-map", "0:a:0?", "-af", "aresample=async=1:first_pts=0",
+                "-ac", str(A_CHANNELS), "-ar", str(A_SAMPLE_RATE),
                 "-f", "f32le", "-y", AUDIO_FIFO]
     return cmd
 
@@ -387,19 +390,35 @@ def video_feeder():
             kf = nk + 1
 
 # ─── feeder audio (silence cadencé si pas d'audio frais — jamais starver) ────
+# Index d'écriture CONTIGU et explicite : AudioWriter.write() sans `index` recalcule
+# `mxlGetCurrentIndex() - n` à CHAQUE appel — deux écritures rapprochées retombent alors sur
+# le même index (écrasement) ou en sautent (les vieux échantillons du ring ressortent), ce qui
+# s'entend en clics. On ancre une fois sur la grille d'échantillons TAI puis on avance de n.
+A_BLK = A_SPMS * 5                       # 5 ms par écriture
+A_MAX_LAG = A_SAMPLE_RATE // 4           # 250 ms de dérive tolérée avant ré-ancrage
+
+def _tai_sample_index():
+    return bobimxl.now_tai() * A_SAMPLE_RATE // 1_000_000_000
+
 def audio_feeder():
     aw = bobimxl.AudioWriter(inst, AUDIO_SHM, channels=A_CHANNELS, sample_rate=A_SAMPLE_RATE,
-                             index_mode=("tai" if GENLOCK else "free"))
-    silence = np.zeros((A_SPMS, A_CHANNELS), dtype=np.float32)
+                             index_mode="free")   # l'index est fourni explicitement à write()
+    silence = np.zeros((A_BLK, A_CHANNELS), dtype=np.float32)
     pending = None                        # reliquat du bloc en cours
-    _aclk = time.time if GENLOCK else time.monotonic
-    t0 = _aclk(); written_ms = 0
+    next_idx = _tai_sample_index() - A_BLK
     while True:
-        due = int((_aclk() - t0) * 1000)
-        guard = 0
-        while written_ms < due and guard < 2000:
-            need = A_SPMS
-            out = np.empty((A_SPMS, A_CHANNELS), dtype=np.float32); pos = 0
+        cur = _tai_sample_index()
+        # Dérive : l'horloge de la SOURCE n'est pas la grille TAI. Trop en retard (backlog) ou
+        # trop en avance (écriture dans le futur) → on ré-ancre, un seul saut plutôt qu'un
+        # décalage qui s'accumule.
+        if abs(cur - next_idx) > A_MAX_LAG:
+            next_idx = cur - A_BLK
+            with audio_lock:
+                _audio_buf.clear()
+            pending = None
+        while next_idx + A_BLK <= cur:
+            need = A_BLK
+            out = np.empty((A_BLK, A_CHANNELS), dtype=np.float32); pos = 0
             with audio_lock:
                 while need > 0:
                     if pending is not None and len(pending):
@@ -416,10 +435,10 @@ def audio_feeder():
                     out = silence
                 else:
                     out[pos:] = 0.0
-            try: aw.write(out)
+            try: aw.write(out, index=next_idx)
             except Exception: pass
-            written_ms += 1; guard += 1
-        time.sleep(0.003)
+            next_idx += A_BLK
+        time.sleep(0.002)
 
 # ─── HTTP : :8080 metrics + :8082 control ────────────────────────────────────
 def _state_payload():
