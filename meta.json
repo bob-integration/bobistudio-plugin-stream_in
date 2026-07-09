@@ -1,11 +1,12 @@
 {
-  "version": "0.1.5",
+  "version": "0.1.6",
   "date": "2026-07-09",
   "changes": {
-    "Audio : clics, bruit et désynchronisation corrigés (0.1.1 → 0.1.5)": [
-      "Clics/bruit : `AudioWriter.write()` sans index explicite recalcule `mxlGetCurrentIndex() - n` à chaque appel — deux écritures rapprochées retombaient sur le même index (écrasement) ou en sautaient (les vieux échantillons du ring ressortaient). ~220 discontinuités/s mesurées dans le flux MXL. Le feeder ancre désormais une fois sur la grille d'échantillons TAI et écrit à un index strictement contigu (blocs de 5 ms).",
-      "Désynchronisation : l'entrée et la sortie tournant toutes deux à 48 kHz, le tampon ne se vide jamais de lui-même et gardait le retard déposé par la rafale de démarrage de ffmpeg (~190 ms d'audio en retard sur la vidéo). Capacité (200 ms, absorbe les rafales) et latence visée (30 ms) sont désormais distinctes : au-delà de 60 ms d'occupation, on draine d'un coup jusqu'à la cible. Latence mesurée en régime établi : 40–60 ms, sans drop ni famine.",
-      "Branche audio ffmpeg : `aresample=async=1` (l'horloge de la source réseau n'est pas la grille TAI) et `-flush_packets 1` (sans lui ffmpeg vidait le fifo par rafales plus grosses que la latence visée, provoquant écrêtage puis famine).",
+    "Audio : clics, désynchronisation et sautillement corrigés (0.1.1 → 0.1.6)": [
+      "Sautillement (0.1.6) : le bus MXL a un contrat de granularité de 1 ms — le streamer lit par blocs de 1 ms et, dès qu'un passage ne trouve pas de bloc complet, injecte du silence pour combler les ms écoulées. En écrivant par blocs de 5 ms, `head_index` avançait par sauts de 5 ms : le consommateur tournait à vide 4 passages sur 5 et bourrait du silence. Écriture ramenée à 1 ms (comme player/avsync), période du feeder < 1 ms pour que la tête avance en continu. Mesuré : 0 silence injecté sur 6 s, à parité avec le player. (NB : le réglage `mtl_audio_ptime` 1 ms/125 µs est le packet time RÉSEAU ST 2110-30, pas la granularité du bus.)",
+      "Clics/bruit (0.1.1) : `AudioWriter.write()` sans index explicite recalcule `mxlGetCurrentIndex() - n` à chaque appel — deux écritures rapprochées retombaient sur le même index (écrasement) ou en sautaient (les vieux échantillons du ring ressortaient). ~220 discontinuités/s mesurées. Le feeder ancre désormais une fois sur la grille d'échantillons TAI et écrit à un index strictement contigu.",
+      "Désynchronisation (0.1.5) : entrée et sortie tournant toutes deux à 48 kHz, le tampon ne se vide jamais de lui-même et gardait le retard déposé par la rafale de démarrage de ffmpeg (~190 ms d'audio en retard sur la vidéo). Capacité (200 ms) et latence visée (30 ms) sont désormais distinctes, avec drainage au seuil haut (60 ms). Latence mesurée : 40–60 ms.",
+      "Branche audio ffmpeg : `aresample=async=1` (l'horloge de la source réseau n'est pas la grille TAI) et `-flush_packets 1` (sans lui ffmpeg vidait le fifo par rafales plus grosses que la latence visée).",
       "Observabilité : `:8080` expose `audio_buf_ms` (= latence audio), `audio_starve_blocks`, `audio_drop_samples`, `audio_reanchors` et `audio_in_sps`."
     ],
     "Première version (0.1.0)": [

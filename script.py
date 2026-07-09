@@ -431,7 +431,14 @@ def video_feeder():
 # `mxlGetCurrentIndex() - n` à CHAQUE appel — deux écritures rapprochées retombent alors sur
 # le même index (écrasement) ou en sautent (les vieux échantillons du ring ressortent), ce qui
 # s'entend en clics. On ancre une fois sur la grille d'échantillons TAI puis on avance de n.
-A_BLK = A_SPMS * 5                       # 5 ms par écriture
+# Granularité d'écriture = 1 ms, comme player/avsync. C'est un CONTRAT avec les consommateurs :
+# le streamer lit par blocs de 1 ms et, dès qu'un passage ne trouve pas de bloc complet, il
+# injecte du silence pour combler les ms écoulées (script.py:audio_feeder). Écrire par blocs de
+# 5 ms fait avancer head_index par sauts de 5 ms → le consommateur tourne à vide 4 passages sur 5
+# et bourre du silence : l'audio « saute ». Ne pas augmenter sans revoir les consommateurs.
+# NB : le réglage `mtl_audio_ptime` (1 ms / 125 µs) est le packet time RÉSEAU ST 2110-30 du moteur
+# 2110_io, pas la granularité du bus — même en 125 µs le chunk shm reste 1 ms. Rien à suivre ici.
+A_BLK = A_SPMS                           # 48 samples = 1 ms
 A_MAX_LAG = A_SAMPLE_RATE // 4           # 250 ms de dérive tolérée avant ré-ancrage
 
 def _tai_sample_index():
@@ -495,7 +502,10 @@ def audio_feeder():
             try: aw.write(out, index=next_idx)
             except Exception: pass
             next_idx += A_BLK
-        time.sleep(0.002)
+        # Période < 1 ms : un seul bloc par passage, donc head_index avance de façon CONTINUE.
+        # Dormir plus longtemps ferait avancer la tête par paquets et rouvrirait la fenêtre
+        # d'injection de silence chez le consommateur (cf. contrat 1 ms ci-dessus).
+        time.sleep(0.0005)
 
 # ─── HTTP : :8080 metrics + :8082 control ────────────────────────────────────
 def _state_payload():

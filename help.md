@@ -52,6 +52,10 @@ figés :
 - `audio_reanchors` : ré-ancrages sur la grille TAI (dérive > 250 ms de l'horloge source).
 - `audio_in_sps` : échantillons/s livrés par ffmpeg (≈ 48000).
 
+Le flux audio est écrit sur le bus par blocs de **1 ms** : c'est le contrat attendu par les
+consommateurs (le streamer lit par blocs de 1 ms et comble au silence ce qui manque). Ne pas
+augmenter cette granularité — l'audio se mettrait à sauter chez les consommateurs.
+
 ## Contrôle
 
 - `GET /state` : état complet (connexion, fps entrée/sortie, âge de la dernière image,
