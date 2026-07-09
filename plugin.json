@@ -178,5 +178,65 @@
   "store": {
     "unique_name": true
   },
-  "state_volume": true
+  "state_volume": true,
+  "actions": [
+    {
+      "id": "enable",
+      "label": "Activer la réception",
+      "endpoint": "/enable",
+      "params": [
+        {
+          "key": "enabled",
+          "label": "Activée",
+          "type": "bool",
+          "default": true
+        }
+      ],
+      "feedback": {
+        "state": "enabled",
+        "value_from": "enabled"
+      }
+    },
+    {
+      "id": "reconnect",
+      "label": "Reconnecter la source",
+      "endpoint": "/reconnect",
+      "params": []
+    },
+    {
+      "id": "source_url",
+      "label": "Changer l'URL de la source",
+      "endpoint": "/source",
+      "params": [
+        {
+          "key": "url",
+          "label": "URL (srt://, rtmp://, …)",
+          "type": "text"
+        }
+      ]
+    }
+  ],
+  "state": [
+    {
+      "id": "enabled",
+      "label": "Réception activée",
+      "endpoint": "/state",
+      "path": "enabled",
+      "type": "bool"
+    },
+    {
+      "id": "conn_state",
+      "label": "État de connexion",
+      "endpoint": "/state",
+      "path": "conn_state",
+      "type": "text"
+    },
+    {
+      "id": "fps",
+      "label": "FPS reçus",
+      "endpoint": "/state",
+      "path": "fps",
+      "type": "number"
+    }
+  ]
 }
