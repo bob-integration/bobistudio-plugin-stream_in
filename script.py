@@ -83,6 +83,74 @@ INTERLACED  = _SCAN_CFG == "i"
 SCAN = ("interlaced_" + FIELD_ORDER) if INTERLACED else "progressive"
 _PLANES = [(Y_SIZE, WIDTH * _BPS), (UV_SIZE, UV_W * _BPS), (UV_SIZE, UV_W * _BPS)]
 
+# ── MODE TRANCHE (chantier latence sous-trame, cf. patch mxl-planar-slices) ─────────────────
+# slice_mode=true → la trame de sortie (déjà COMPLÈTE : décodée/conformée par ffmpeg, ou mire/
+# noir/gel) est émise PAR BANDES avec commit progressif (validSlices=1..N, pattern delay
+# _emit_frame_sliced) → l'aval slice-aware démarre sur la 1ʳᵉ bande au lieu d'attendre la
+# trame. Les lignes arrivent du pipe ffmpeg par trame ENTIÈRE : le gain vient de la
+# parallélisation écriture/lecture aval, pas du décodage. TOUS les chemins d'émission
+# (connecté, mire, noir, gel) passent par _write_video → un seul point à trancher, commit
+# FINAL garanti (try/finally). Le contrat genlock/index et le pacing NE CHANGENT PAS.
+# Éligibilité : sortie PROGRESSIVE + hauteur divisible (algo delay _out_slice_h) ;
+# entrelacé → repli whole-frame. slice_mode absent/False → octet-identique à l'historique.
+SLICE_MODE  = _as_bool(CONFIG.get("slice_mode"), default=False)
+SLICE_LINES = max(1, int(CONFIG.get("slice_lines") or 36))
+_SLICE_TARGET = max(1, 1080 // SLICE_LINES)
+
+def _out_slice_h(oh, ch=1):
+    """MODE TRANCHE — slice_height de la sortie (même algo que delay/pyramide) : le plus petit
+    diviseur sh de oh avec sh ≥ max(1, oh // _SLICE_TARGET), MULTIPLE de ch (lignes chroma
+    entières par bande). Aucun diviseur raisonnable (sh > oh//2) → 0 = inéligible."""
+    lo = max(1, oh // _SLICE_TARGET)
+    for sh in range(lo, oh // 2 + 1):
+        if oh % sh == 0 and sh % ch == 0:
+            return sh
+    return 0
+
+V_SLICE_H = _out_slice_h(HEIGHT, _CH) if (SLICE_MODE and not INTERLACED) else 0
+_V_TOTAL_SLICES = (HEIGHT // V_SLICE_H) if V_SLICE_H else 1
+# kwargs Writer : le flowDef porte slice_height quand éligible, sinon inchangé (historique).
+_SLICE_KW = {{"slice_height": V_SLICE_H}} if V_SLICE_H else {{}}
+_Y_ROW  = WIDTH * _BPS
+_UV_ROW = UV_W * _BPS
+if SLICE_MODE:
+    print("slice_mode %s : sortie %s %s" % ("actif" if V_SLICE_H else "INÉLIGIBLE", HOSTNAME,
+          ("tranchée par %d lignes (%d tranches)" % (V_SLICE_H, _V_TOTAL_SLICES)) if V_SLICE_H
+          else "(%s) → chemin historique"
+          % ("entrelacé" if INTERLACED else "hauteur %d sans diviseur" % HEIGHT)))
+
+def _copy_band(dst, src, a, b):
+    """MODE TRANCHE — copie IDENTITÉ des lignes image [a, b) sur les 3 plans (Y|Cb|Cr) du
+    payload planar, en OCTETS plats. `b` est toujours un multiple de V_SLICE_H (lui-même
+    multiple de _CH) → lignes chroma entières. Renvoie b."""
+    if b <= a:
+        return a
+    dst[a * _Y_ROW:b * _Y_ROW] = src[a * _Y_ROW:b * _Y_ROW]
+    ca = a // _CH; cb = b // _CH
+    if cb > ca:
+        o1 = Y_SIZE; o2 = Y_SIZE + UV_SIZE
+        dst[o1 + ca * _UV_ROW:o1 + cb * _UV_ROW] = src[o1 + ca * _UV_ROW:o1 + cb * _UV_ROW]
+        dst[o2 + ca * _UV_ROW:o2 + cb * _UV_ROW] = src[o2 + ca * _UV_ROW:o2 + cb * _UV_ROW]
+    return b
+
+def _emit_grain_sliced(w, gi, vw, data):
+    """MODE TRANCHE — émet une trame déjà COMPLÈTE dans un grain OUVERT, par bandes + commit
+    progressif (validSlices=1..N, quasi gratuit). Commit FINAL garanti par le finally (un
+    grain laissé partiel ne serait jamais lisible) — y compris sur les chemins mire/gel."""
+    try:
+        src = np.frombuffer(data, dtype=np.uint8)
+        if src.size < V_FRAME_SIZE:
+            n = min(src.size, len(vw))
+            vw[:n] = src[:n]           # frame courte (défensif) : copie pleine, pas de bandes
+            return
+        a = 0
+        for k in range(1, _V_TOTAL_SLICES + 1):
+            a = _copy_band(vw, src, a, min(HEIGHT, k * V_SLICE_H))
+            if k < _V_TOTAL_SLICES:
+                w.commit(gi, valid_slices=k)   # réveille l'aval à chaque bande
+    finally:
+        w.commit(gi, valid_slices=None)
+
 A_SAMPLE_RATE = 48000
 A_CHANNELS    = 8
 A_SPMS        = A_SAMPLE_RATE // 1000        # samples per ms (48)
@@ -102,7 +170,9 @@ metrics = {{"fps": 0.0, "frame_index": 0, "plugin_version": PLUGIN_VERSION,
            # ré-ancrage (dérive horloge source ↔ grille TAI) — tous trois s'entendent.
            "audio_starve_blocks": 0, "audio_drop_samples": 0, "audio_reanchors": 0,
            "audio_buf_ms": 0.0, "audio_in_sps": 0.0,
-           "enabled": ENABLED, "net_in_kbps": 0.0}}
+           "enabled": ENABLED, "net_in_kbps": 0.0,
+           "slice_mode": bool(V_SLICE_H), "slice_h": V_SLICE_H,
+           "total_slices": _V_TOTAL_SLICES}}
 
 frame_lock = threading.Lock()
 _last_frame = None            # bytes de la dernière trame conformée reçue
@@ -253,6 +323,11 @@ def _write_video(w, frame_bytes, fbase):
                 _i, gi, vw = w.open_grain(index=fi)
                 n = min(len(fb), len(vw)); vw[:n] = np.frombuffer(fb, dtype=np.uint8, count=n)
                 w.commit(gi)
+        elif V_SLICE_H:
+            # MODE TRANCHE : émission par bandes de la trame déjà complète (commit progressif).
+            # Même open_grain (index genlock inchangé), même pacing — seul le commit change.
+            _i, gi, vw = w.open_grain(index=(fbase if GENLOCK else None))
+            _emit_grain_sliced(w, gi, vw, frame_bytes)
         else:
             _i, gi, vw = w.open_grain(index=(fbase if GENLOCK else None))
             n = min(len(frame_bytes), len(vw))
@@ -545,7 +620,8 @@ def supervisor():
 def video_feeder():
     global _last_frame_mono
     shm = bobimxl.Writer(inst, VIDEO_SHM, WIDTH, HEIGHT, CHROMA, BIT_DEPTH, FPS_NUM, FPS_DEN,
-                         index_mode=("tai" if GENLOCK else "free"), interlace=SCAN)
+                         index_mode=("tai" if GENLOCK else "free"), interlace=SCAN,
+                         **_SLICE_KW)
     idx = 0
     last_conn = None
     period_ns = round(1e9 * FPS_DEN / FPS_NUM)
@@ -557,10 +633,15 @@ def video_feeder():
             bus_error.clear()
             try: shm.close()
             except Exception: pass
+            # GC ENTRE close et reopen (parade générique du chantier tranche) : sans lui, la
+            # réouverture PAR NOM peut retomber sur la génération orpheline qu'on vient de lâcher.
+            try: inst.garbage_collect()
+            except Exception: pass
             time.sleep(1)
             shm = bobimxl.Writer(inst, VIDEO_SHM, WIDTH, HEIGHT, CHROMA, BIT_DEPTH,
                                  FPS_NUM, FPS_DEN,
-                                 index_mode=("tai" if GENLOCK else "free"), interlace=SCAN)
+                                 index_mode=("tai" if GENLOCK else "free"), interlace=SCAN,
+                                 **_SLICE_KW)
             kf = _grid_k(_grid_now_ns()) + 2
         G = _grid_ns(kf)
         if GENLOCK:

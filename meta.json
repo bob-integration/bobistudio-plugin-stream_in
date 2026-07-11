@@ -1,7 +1,15 @@
 {
-  "version": "0.2.2",
-  "date": "2026-07-09",
+  "version": "0.3.0",
+  "date": "2026-07-11",
   "changes": {
+    "Mode tranche MXL (0.3.0)": [
+      "slice_mode=true (param de déploiement, défaut OFF = octet-identique) : la sortie vidéo est émise PAR BANDES avec commit progressif (validSlices=1..N, pattern des producteurs player/stills) — l'aval slice-aware démarre sur la 1ʳᵉ bande au lieu d'attendre la trame complète.",
+      "Les trames sortent du pipe ffmpeg ENTIÈRES : l'émission re-tranche la trame décodée dès qu'elle est disponible (comme le delay D≥1). Le gain vient de la parallélisation écriture/lecture aval, pas du décodage.",
+      "Tous les états passent par le même point d'émission (connecté, mire, noir, gel) : signal tranché continu, commit final garanti (try/finally).",
+      "slice_lines pilote la granularité cible (36 lignes ≈ 30 tranches en 1080p), adaptée via _out_slice_h (diviseur de la hauteur, multiple des lignes chroma). Éligibilité : sortie progressive + hauteur divisible ; entrelacé → repli whole-frame loggé.",
+      "Observabilité :8080 : slice_mode / slice_h / total_slices.",
+      "Robustesse : garbage_collect() entre close et reopen du Writer sur SIGBUS (parade générique du chantier tranche — la réouverture par nom ne retombe plus sur une génération orpheline)."
+    ],
     "Journal persistant sur volume d'état (0.2.2)": [
       "Le rootfs d'un conteneur est RECRÉÉ à chaque déploiement et au boot du nœud : le journal écrit dans /opt/script disparaissait précisément quand il sert, après une coupure. Vérifié sur banc : après un reboot de nœud, il ne restait aucun événement antérieur.",
       "Nouveau `state_volume` déclaratif dans le manifeste (calqué sur `media_volume`) : le conteneur reçoit un dossier persistant du nœud, /var/lib/bobi/state/<hostname> → /var/lib/bobi. Le journal s'y écrit, avec repli sur /opt/script. Vérifié : 8 événements antérieurs conservés à travers une recréation de conteneur.",
