@@ -1,7 +1,10 @@
 {
-  "version": "0.3.0",
-  "date": "2026-07-11",
+  "version": "0.3.1",
+  "date": "2026-07-12",
   "changes": {
+    "Réglages mode tranche (0.3.1)": [
+      "Exposition des réglages du mode tranche dans le panneau ⚙ Réglages et la palette (config_schema, scope system) : slice_mode, slice_lines. Schéma/UI seulement — aucun changement de comportement du script."
+    ],
     "Mode tranche MXL (0.3.0)": [
       "slice_mode=true (param de déploiement, défaut OFF = octet-identique) : la sortie vidéo est émise PAR BANDES avec commit progressif (validSlices=1..N, pattern des producteurs player/stills) — l'aval slice-aware démarre sur la 1ʳᵉ bande au lieu d'attendre la trame complète.",
       "Les trames sortent du pipe ffmpeg ENTIÈRES : l'émission re-tranche la trame décodée dès qu'elle est disponible (comme le delay D≥1). Le gain vient de la parallélisation écriture/lecture aval, pas du décodage.",
