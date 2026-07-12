@@ -3,7 +3,7 @@
   "label": "Stream In",
   "runtime": "docker",
   "image": "media",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "script_template": "script.py",
   "ui": {
     "control_html": "control.html",
@@ -147,6 +147,7 @@
     },
     {
       "key": "slice_mode",
+      "hidden": true,
       "type": "checkbox",
       "label": "Mode tranche (latence sous-image)",
       "help": "La vidéo est publiée bande par bande sur le bus MXL : l'aval démarre sur la première bande sans attendre l'image complète (latence sous-image). Entrelacé ou hauteur non divisible → repli image entière. Désactivé (défaut) = comportement historique.",
@@ -155,6 +156,7 @@
     },
     {
       "key": "slice_lines",
+      "hidden": true,
       "type": "number",
       "label": "Lignes par tranche",
       "help": "Hauteur des bandes (lignes). Doit être un diviseur de la hauteur d'image (36 pour 1080p) — sinon repli image entière.",
