@@ -3,7 +3,7 @@
   "label": "Stream In",
   "runtime": "docker",
   "image": "media",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "script_template": "script.py",
   "ui": {
     "control_html": "control.html",
@@ -41,7 +41,8 @@
     "genlock_phase_ms": 0.0,
     "idle_mode": "bars",
     "freeze_timeout_ms": 1000,
-    "enabled": true
+    "enabled": true,
+    "log_level": "info"
   },
   "config_schema": [
     {
@@ -167,6 +168,32 @@
       "visible_if": {
         "slice_mode": true
       }
+    },
+    {
+      "key": "log_level",
+      "type": "select",
+      "label": "Niveau de log",
+      "help": "Verbosité du journal du conteneur. Défaut « Événements » : les faits marquants (démarrage/arrêt, changement de format, reconnexion, repli sur un chemin dégradé, entrée qui apparaît ou disparaît) sont TOUJOURS écrits — après une panne le journal doit permettre de reconstituer l'histoire, et élever le niveau après coup ne récupère rien. Les métriques périodiques (fps, compteurs) ne sont PAS journalisées : elles sont déjà publiées sur :8080. « Détaillé » = lance-flammes par trame, à n'activer que le temps d'un diagnostic (le journal Docker n'est pas roté).",
+      "options": [
+        {
+          "value": "debug",
+          "label": "Détaillé (par trame — diagnostic ponctuel)"
+        },
+        {
+          "value": "info",
+          "label": "Événements (défaut)"
+        },
+        {
+          "value": "warning",
+          "label": "Anomalies seules"
+        },
+        {
+          "value": "error",
+          "label": "Erreurs seules"
+        }
+      ],
+      "default": "info",
+      "scope": "user"
     }
   ],
   "wiring": {
