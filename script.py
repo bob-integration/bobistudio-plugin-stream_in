@@ -850,6 +850,7 @@ def _state_payload():
               "freeze_timeout_ms": FREEZE_TIMEOUT_MS, "genlock": GENLOCK,
               "source_format": dict(_src_fmt),
               "journal_persistent": JOURNAL_PERSISTENT,
+              "log_level": LOG_LEVEL,   # lisible en condition de macro
               "history": hist, "history_seconds": HIST_SECONDS,
               "last_errors": list(_stderr_tail)}})
     return m
@@ -915,6 +916,14 @@ class ControlHandler(BaseHTTPRequestHandler):
         elif self.path == "/events/clear":
             journal_clear()
             self._send_json(200, {{"ok": True}})
+        elif self.path == "/log_level":
+            # Verbosité À CHAUD (pas de redéploiement) : instruction d'incident. Le niveau
+            # PERSISTANT reste le champ `log_level` du config_schema ; celui-ci est volatil.
+            body = self._body()
+            if body is None:
+                self._send_json(400, {{"error": "JSON invalide"}}); return
+            ok = set_log_level(body.get("level") or body.get("log_level"))
+            self._send_json(200 if ok else 400, {{"ok": ok, "log_level": LOG_LEVEL}})
         else:
             self.send_response(404); self.end_headers()
     def log_message(self, *a): pass

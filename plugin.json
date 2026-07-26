@@ -3,7 +3,7 @@
   "label": "Stream In",
   "runtime": "docker",
   "image": "media",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "script_template": "script.py",
   "ui": {
     "control_html": "control.html",
@@ -218,7 +218,8 @@
       "/source",
       "/enable",
       "/events",
-      "/events/clear"
+      "/events/clear",
+      "/log_level"
     ],
     "read_endpoints": [
       "/state",
@@ -264,6 +265,37 @@
           "type": "text"
         }
       ]
+    },
+    {
+      "id": "log_level",
+      "label": "Niveau de log (à chaud)",
+      "endpoint": "/log_level",
+      "params": [
+        {
+          "key": "level",
+          "label": "Niveau",
+          "type": "text",
+          "default": "info",
+          "options": [
+            {
+              "value": "debug",
+              "label": "Détaillé"
+            },
+            {
+              "value": "info",
+              "label": "Événements (défaut)"
+            },
+            {
+              "value": "warning",
+              "label": "Anomalies seules"
+            },
+            {
+              "value": "error",
+              "label": "Erreurs seules"
+            }
+          ]
+        }
+      ]
     }
   ],
   "state": [
@@ -288,5 +320,27 @@
       "path": "fps",
       "type": "number"
     }
-  ]
+  ],
+  "param_tree": {
+    "global_groups": [
+      {
+        "label": "Journal (diagnostic)",
+        "endpoint": "/log_level",
+        "fields": {
+          "level": {
+            "label": "Niveau de log",
+            "type": "enum",
+            "options": [
+              "debug",
+              "info",
+              "warning",
+              "error"
+            ],
+            "default": "info",
+            "path": "log_level"
+          }
+        }
+      }
+    ]
+  }
 }
