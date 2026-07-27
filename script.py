@@ -665,7 +665,7 @@ def supervisor():
 def video_feeder():
     global _last_frame_mono
     shm = bobimxl.Writer(inst, VIDEO_SHM, WIDTH, HEIGHT, CHROMA, BIT_DEPTH, FPS_NUM, FPS_DEN,
-                         index_mode=("tai" if GENLOCK else "free"), interlace=SCAN,
+                         interlace=SCAN,
                          **_SLICE_KW)
     idx = 0
     last_conn = None
@@ -685,7 +685,7 @@ def video_feeder():
             time.sleep(1)
             shm = bobimxl.Writer(inst, VIDEO_SHM, WIDTH, HEIGHT, CHROMA, BIT_DEPTH,
                                  FPS_NUM, FPS_DEN,
-                                 index_mode=("tai" if GENLOCK else "free"), interlace=SCAN,
+                                 interlace=SCAN,
                                  **_SLICE_KW)
             kf = _grid_k(_grid_now_ns()) + 2
         G = _grid_ns(kf)
@@ -753,8 +753,7 @@ def _tai_sample_index():
 
 def audio_feeder():
     global _audio_buf_n
-    aw = bobimxl.AudioWriter(inst, AUDIO_SHM, channels=A_CHANNELS, sample_rate=A_SAMPLE_RATE,
-                             index_mode="free")   # l'index est fourni explicitement à write()
+    aw = bobimxl.AudioWriter(inst, AUDIO_SHM, channels=A_CHANNELS, sample_rate=A_SAMPLE_RATE)   # l'index est fourni explicitement à write()
     silence = np.zeros((A_BLK, A_CHANNELS), dtype=np.float32)
     pending = None                        # reliquat du bloc en cours
     next_idx = _tai_sample_index() - A_BLK
