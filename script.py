@@ -10,6 +10,15 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import bobimxl   # sortie vidéo (Writer) + audio (AudioWriter) sur le domaine MXL
 
+
+def _mxl_lib_state():
+    """Variante libmxl réellement chargée (baseline / x86-64-v3) — diagnostic seul, ne doit
+    JAMAIS faire échouer /state."""
+    try:
+        return bobimxl.lib_info()
+    except Exception:
+        return None
+
 CONFIG         = {config}            # dict injected at deploy
 HOSTNAME       = "{hostname}"
 PLUGIN_VERSION = "{plugin_version}"
@@ -851,7 +860,8 @@ def _state_payload():
               "journal_persistent": JOURNAL_PERSISTENT,
               "log_level": LOG_LEVEL,   # lisible en condition de macro
               "history": hist, "history_seconds": HIST_SECONDS,
-              "last_errors": list(_stderr_tail)}})
+              "last_errors": list(_stderr_tail),
+              "mxl_lib": _mxl_lib_state()}})
     return m
 
 class MetricsHandler(BaseHTTPRequestHandler):
