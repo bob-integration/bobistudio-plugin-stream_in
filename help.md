@@ -16,6 +16,11 @@ L'IP affichée est celle du **conteneur** (macvlan) : elle est directement joign
 LAN, sans redirection de port. Le port d'écoute est libre — vérifier qu'il ne collisionne
 pas avec une autre instance sur le même nœud.
 
+**Passphrase / Stream ID** (modes SRT) : la passphrase chiffre le transport (AES, à
+renseigner identique des deux côtés) ; le Stream ID sert au routage/authentification côté
+certains encodeurs ou plateformes (Haivision, Wowza…) qui l'exigent pour accepter la
+connexion. Les deux sont facultatifs et s'appliquent aux deux modes SRT (écoute et appel).
+
 ## Point d'entrée
 
 L'adresse affichée dans le panneau **est** l'adresse réglable : le port (modes écoute), les
@@ -46,6 +51,14 @@ profondeur, balayage) : scale bicubique, conversion de cadence, désentrelacemen
 si l'entrée est entrelacée. La sortie MXL est donc un signal broadcast propre et stable quel
 que soit ce qu'envoie la source. Pour une sortie entrelacée (ex. 1080i50) : cadence = cadence
 **trame** (25) et balayage = entrelacé.
+
+## Genlock
+
+**Genlock (grille PTP)** (activé par défaut) : l'image de sortie est écrite sur un index
+calé sur la grille PTP rationnelle — une trame par tick, comme un producteur normal du
+pipeline, alignée avec les autres sources pour un mixage/multiview cohérent. Désactivé, la
+sortie suit le rythme d'arrivée de la source (index libre) : à réserver aux cas où l'aval ne
+dépend d'aucune synchro de grille (rare — ne pas désactiver sans raison précise).
 
 ## États
 
@@ -78,6 +91,15 @@ figés :
 Le flux audio est écrit sur le bus par blocs de **1 ms** : c'est le contrat attendu par les
 consommateurs (le streamer lit par blocs de 1 ms et comble au silence ce qui manque). Ne pas
 augmenter cette granularité — l'audio se mettrait à sauter chez les consommateurs.
+
+## Mode tranche (latence réduite)
+
+Paramètre avancé `slice_mode` (désactivé par défaut, comportement inchangé) : la sortie
+vidéo — déjà décodée/conformée par ffmpeg — est publiée bande par bande sur le bus MXL au
+lieu d'attendre l'image complète, pour retirer une image de latence à l'aval (multiview,
+mixer, streamer en mode tranche). `slice_lines` fixe la hauteur des bandes et doit diviser
+la hauteur de sortie (36 pour 1080p) ; sinon repli automatique en image entière. Une source
+entrelacée retombe aussi en image entière. N'affecte ni l'ingest ni l'audio.
 
 ## Contrôle
 
