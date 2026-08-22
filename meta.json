@@ -1,7 +1,12 @@
 {
-  "version": "0.7.0",
-  "date": "2026-08-02",
+  "version": "0.8.0",
+  "date": "2026-08-22",
   "changes": {
+    "Un réglage sans effet est refusé, au lieu d'être accepté en silence (0.8.0)": [
+      "Deux champs déterminent le point d'entrée — `url` et `listen_port` — et un seul s'applique selon le mode : les modes ÉCOUTE se lient à `listen_port`, les modes APPEL/PULL ouvrent `url`. `/source` acceptait pourtant les deux dans tous les modes, les persistait, et n'en faisait rien. Régler « srt://…:10000 » sur une entrée en écoute laissait donc l'écoute sur son port d'avant : le réglage était visible en base, absent du comportement, et rien ne le disait.",
+      "`/source` connaît maintenant son mode et REFUSE (400) tout champ inerte, en nommant celui qui gouverne. Le refus est franc même si d'autres champs de la même requête ont pris — accepter à moitié en répondant « ok » laisse croire que tout est posé.",
+      "L'action de macro « Changer l'URL de la source » n'exposait que `url`, sans dire qu'elle est sans effet en écoute : c'est par là que le réglage inerte se posait. Elle devient deux actions explicitement nommées par mode — « URL de la source distante (modes APPEL/PULL) » et « Port d'écoute (modes ÉCOUTE) ». La page de contrôle, elle, faisait déjà la distinction correctement."
+    ],
     "Variante libmxl exposée dans /state (0.7.0)": [
       "GET /state porte désormais `mxl_lib` : {path, variante} de la libmxl RÉELLEMENT chargée (x86-64-v3/glibc-hwcaps ou baseline), lu via bobimxl.lib_info(). Jusqu'ici cette information n'était constatable que PAR NŒUD (app/placement.py) — un conteneur retombé sur la baseline (~20 % de coût en régime consommateur) ne se voyait qu'indirectement. Protégé par try/except : une erreur de lecture ne casse jamais /state."
     ],

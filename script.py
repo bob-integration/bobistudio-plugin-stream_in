@@ -824,10 +824,28 @@ def audio_feeder():
 
 # ─── HTTP : :8080 metrics + :8082 control ────────────────────────────────────
 _SRC_INT = ("listen_port", "srt_latency_ms")
+# ─── Ce qui a un EFFET, selon le mode ────────────────────────────────────────────────────────
+# Les modes ÉCOUTE se lient à `listen_port` et n'ouvrent jamais `url` ; les modes APPEL/PULL font
+# l'inverse. Un champ posé hors de son mode était accepté, persisté, et sans le moindre effet :
+# régler « srt://…:10000 » sur une entrée en écoute laissait l'écoute sur son port d'avant, sans
+# rien signaler. C'est le champ qui doit refuser, pas l'exploitant qui doit connaître la règle.
+_SRC_UTILES = {{
+    "srt_listener": ("listen_port", "srt_latency_ms", "srt_passphrase", "srt_streamid"),
+    "rtmp_server":  ("listen_port", "rtmp_app", "rtmp_key"),
+    "srt_caller":   ("url", "srt_latency_ms", "srt_passphrase", "srt_streamid"),
+    "rtmp_pull":    ("url",),
+}}
 _SRC_STR = ("url", "srt_passphrase", "srt_streamid", "rtmp_app", "rtmp_key")
 
 def _apply_source(body):
-    """Applique un nouveau point d'entrée à chaud. Renvoie les clés effectivement changées."""
+    """Applique un nouveau point d'entrée à chaud.
+
+    Renvoie (changed, inertes) : `inertes` = les clés fournies qui n'ont AUCUN effet dans le mode
+    courant. L'appelant en fait une erreur — les avaler en silence est ce qui a fait croire qu'un
+    port était réglé alors que l'écoute tournait ailleurs."""
+    _utiles = _SRC_UTILES.get(MODE) or (_SRC_INT + _SRC_STR)
+    inertes = sorted(k for k in body if k in (_SRC_INT + _SRC_STR) and k not in _utiles)
+    body = {{k: v for k, v in body.items() if k not in inertes}}
     changed = []
     with src_lock:
         for k in _SRC_INT:
@@ -844,7 +862,9 @@ def _apply_source(body):
     if changed:
         journal("source_change", changed=changed, source=_input_url().split("?", 1)[0])
         _reconnect_req.set()          # relance ffmpeg sur la nouvelle adresse
-    return changed
+    if inertes:
+        journal("source_inerte", mode=MODE, ignores=inertes)
+    return changed, inertes
 
 def _state_payload():
     with metrics_lock: m = dict(metrics)
@@ -910,7 +930,17 @@ class ControlHandler(BaseHTTPRequestHandler):
             body = self._body()
             if body is None:
                 self._send_json(400, {{"error": "JSON invalide"}}); return
-            self._send_json(200, {{"ok": True, "applied": _apply_source(body)}})
+            _chg, _inertes = _apply_source(body)
+            if _inertes:
+                # 400 dès qu'un champ est inerte, MÊME si d'autres ont pris : accepter à moitié en
+                # rendant « ok » laisse croire que tout est posé. Le message NOMME le champ utile.
+                _att = {{"srt_listener": "listen_port", "rtmp_server": "listen_port"}}.get(MODE, "url")
+                self._send_json(400, {{
+                    "ok": False, "applied": _chg, "ignored": _inertes, "mode": MODE,
+                    "error": "en mode %s, %s n'a aucun effet — le champ qui gouverne est « %s »"
+                             % (MODE, " et ".join(_inertes), _att)}})
+                return
+            self._send_json(200, {{"ok": True, "applied": _chg}})
         elif self.path == "/enable":
             body = self._body()
             if body is None:

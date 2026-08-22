@@ -3,7 +3,7 @@
   "label": "Stream In",
   "runtime": "docker",
   "image": "media",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "script_template": "script.py",
   "ui": {
     "control_html": "control.html",
@@ -256,15 +256,36 @@
     },
     {
       "id": "source_url",
-      "label": "Changer l'URL de la source",
+      "label": "URL de la source distante (modes APPEL/PULL seulement)",
+      "help": "Ne s'applique qu'en « SRT — appel » et « RTMP — pull », où le plugin va CHERCHER le flux. En mode écoute, c'est le port d'écoute qui gouverne (action « Port d'écoute ») et ce champ est refusé.",
       "endpoint": "/source",
       "params": [
         {
           "key": "url",
-          "label": "URL (srt://, rtmp://, …)",
+          "label": "URL (srt://hôte:port, rtmp://hôte/app/clé)",
           "type": "text"
         }
       ]
+    },
+    {
+      "id": "source_port",
+      "label": "Port d'écoute (modes ÉCOUTE seulement)",
+      "help": "Ne s'applique qu'en « SRT — écoute » et « RTMP — serveur », où la source POUSSE vers le conteneur. C'est ce port, et non l'URL, qui détermine l'adresse à viser. En mode appel/pull ce champ est refusé.",
+      "endpoint": "/source",
+      "params": [
+        {
+          "key": "listen_port",
+          "label": "Port",
+          "type": "number",
+          "min": 1024,
+          "max": 65535,
+          "default": 9000
+        }
+      ],
+      "feedback": {
+        "state": "listen_port",
+        "value_from": "listen_port"
+      }
     },
     {
       "id": "log_level",
