@@ -1,0 +1,6 @@
+{
+ "plugin.stream_in.drop_ceiling": "plafond",
+ "plugin.stream_in.drop_drain": "drainage",
+ "plugin.stream_in.ph_rtmp": "rtmp://hôte/app/clé",
+ "plugin.stream_in.ph_srt": "srt://hôte:port"
+}

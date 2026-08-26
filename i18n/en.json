@@ -1,0 +1,6 @@
+{
+ "plugin.stream_in.drop_ceiling": "ceiling",
+ "plugin.stream_in.drop_drain": "drain",
+ "plugin.stream_in.ph_rtmp": "rtmp://host/app/key",
+ "plugin.stream_in.ph_srt": "srt://host:port"
+}
