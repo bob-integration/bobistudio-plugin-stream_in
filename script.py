@@ -113,6 +113,41 @@ GENLOCK_PHASE_MS = float(CONFIG.get("genlock_phase_ms") or 0.0)
 IDLE_MODE = str(CONFIG.get("idle_mode") or "bars")
 FREEZE_TIMEOUT_MS = int(CONFIG.get("freeze_timeout_ms") or 1000)
 
+# ─── dérivation du flux ENTRANT (diagnostic) ─────────────────────────────────
+# « hôte:port » → ffmpeg recopie le flux reçu, SANS transcodage, vers cette adresse UDP. C'est
+# le seul moyen d'inspecter ce qu'on REÇOIT réellement (relation A/V des pts, cadence annoncée,
+# structure GOP) : le flux arrive par une connexion SRT à consommateur unique, personne d'autre
+# ne peut le tapper, et une mesure prise APRÈS notre propre chaîne ne distingue pas ce qui vient
+# de la source de ce qu'on a ajouté. Vide = désactivé (aucune sortie supplémentaire).
+TAP_UDP = str(CONFIG.get("tap_udp") or "").strip()
+
+# ─── verrouillage A/V sur la ligne de temps de la SOURCE ─────────────────────
+# Les deux filtres ffmpeg déjà en place SONT la référence temporelle qui manquait :
+#   `fps=N/D:start_time=0`            → la trame de sortie n° n est au pts source n·D/N
+#   `aresample=async=1:first_pts=0`   → l'échantillon n° s est au pts source s/48000
+# Même axe, même origine (ffmpeg normalise les deux streams sur le start_time de l'entrée) :
+# trame n ↔ échantillon n·48000·D/N, EXACTEMENT. Le verrou écrit l'audio à la case TAI de la
+# trame qui lui correspond, au lieu de le débiter au fil de l'eau.
+# Sans lui, la latence audio EST l'occupation du tampon, qui erre entre les seuils de
+# drainage : mesuré 2026-08-23 sur liaison SRT réelle, vidéo 517 ms (σ 8), audio 576 ms
+# (σ 59), écart A/V de −47 à +187 ms. Réglage d'échappement : av_lock=0 rend le comportement
+# historique à l'octet (y compris la commande ffmpeg).
+AV_LOCK = _as_bool(CONFIG.get("av_lock", False), default=False)
+# Retenue vidéo. Verrouiller l'audio sur l'instant de présentation vidéo lui RETIRE sa marge
+# d'arrivée : le tampon ne la porte plus, et tout bloc en retard devient du silence. On
+# présente donc la vidéo N trames plus tard — les DEUX essences décalées d'autant, lip-sync
+# inchangé — pour rendre cette marge au chemin audio. 0 = aucune retenue ; la marge réellement
+# observée se lit dans `audio_headroom_ms` (minimum glissant), c'est elle qui doit décider.
+def _av_margin(v):
+    # `or 0` serait un piège : la coercion du manifeste rend None pour une clé absente (tout
+    # conteneur d'avant la 0.9.0), et la retenue tomberait SILENCIEUSEMENT à 0 au lieu du défaut
+    # annoncé. Un 0 EXPLICITE, lui, doit être respecté.
+    try:
+        return max(0, min(10, int(v)))
+    except (TypeError, ValueError):
+        return 1
+AV_MARGIN_FRAMES = _av_margin(CONFIG.get("av_margin_frames", 1))
+
 # ─── formats shm (identiques au pipeline MXL, cf. player/avsync) ─────────────
 CHROMA    = str(CONFIG.get("chroma") or "422")
 BIT_DEPTH = int(CONFIG.get("bit_depth") or 8)
@@ -209,10 +244,25 @@ A_SAMPLE_RATE = 48000
 A_CHANNELS    = 8
 A_SPMS        = A_SAMPLE_RATE // 1000        # samples per ms (48)
 
+def _samples_at_frame(n):
+    """Numéro d'échantillon audio du DÉBUT de la trame n, sur l'axe de pts partagé par les
+    deux sorties ffmpeg. Rationnel exact : 48000·D/N n'est pas entier en NTSC fractionnaire."""
+    return n * A_SAMPLE_RATE * FPS_DEN // FPS_NUM
+
+_AV_R        = max(1, A_SAMPLE_RATE * FPS_DEN // FPS_NUM)   # échantillons par trame (≈960)
+_AV_DEADBAND = max(1, _AV_R)               # en deçà, on ne déplace pas le verrou (une trame)
+_AV_WINDOW_NS = 5_000_000_000              # fenêtre de la médiane (cf. _av_note)
+
 inst = bobimxl.Instance()
 VIDEO_SHM = HOSTNAME
 AUDIO_SHM = HOSTNAME + "_audio"
-AUDIO_FIFO = "/tmp/stream_in_audio.f32"
+# Un fifo PAR GÉNÉRATION ffmpeg. Avec un fifo unique, le reliquat d'une session et les
+# premiers blocs de la suivante arrivent dans le même flux d'octets : impossible de dire à
+# quelle ligne de temps un bloc appartient — donc impossible de verrouiller sans risquer de
+# poser l'audio d'AVANT une reconnexion sur la grille d'APRÈS. Le chemin porte la génération.
+AUDIO_FIFO_DIR = "/tmp"
+def _audio_fifo_path(gen):
+    return "%s/stream_in_audio.%d.f32" % (AUDIO_FIFO_DIR, gen)
 
 # ─── état partagé ────────────────────────────────────────────────────────────
 metrics_lock = threading.Lock()
@@ -223,7 +273,31 @@ metrics = {{"fps": 0.0, "frame_index": 0, "plugin_version": PLUGIN_VERSION,
            # Santé du chemin audio : famine (silence inséré), drop (buffer saturé) et
            # ré-ancrage (dérive horloge source ↔ grille TAI) — tous trois s'entendent.
            "audio_starve_blocks": 0, "audio_drop_samples": 0, "audio_reanchors": 0,
-           "audio_buf_ms": 0.0, "audio_in_sps": 0.0,
+           # QUI jette ? Les trois causes n'ont ni le même sens ni le même remède : le PLAFOND
+           # (le lecteur déborde, capacité insuffisante ou consommation en retard), le DRAINAGE
+           # (on rend volontairement de la latence installée) et le RÉ-ANCRAGE (on repart de
+           # zéro). `audio_drop_samples` les somme et masquait laquelle domine.
+           "audio_drop_plafond": 0, "audio_drop_drainage": 0, "audio_drop_reancrage": 0,
+           "audio_drop_generation": 0,
+           # `audio_buf_ms` est un PIC (relevé juste après un ajout) : il mesure la taille des
+           # rafales d'écriture de ffmpeg, PAS la latence. La latence, c'est le BAS DE L'EAU —
+           # ce qui reste en permanence dans le tampon. Les confondre a fait dimensionner le
+           # plafond sur un pic et jeter 40 % de l'audio (cf. en-tête du tampon).
+           "audio_buf_ms": 0.0, "audio_latence_ms": None, "audio_in_sps": 0.0,
+           # Verrouillage A/V : `av_locked` dit si le décalage est ÉTABLI (une trame présentée
+           # depuis le démarrage de ffmpeg), pas si le réglage est coché — un verrou demandé
+           # mais jamais accroché est le cas qu'il faut voir. `audio_headroom_ms` = marge
+           # d'arrivée minimale sur la seconde écoulée (négatif = l'audio arrive APRÈS sa case).
+           "av_lock": AV_LOCK, "av_locked": False, "av_margin_frames": AV_MARGIN_FRAMES,
+           # `av_relocks` : le verrou SUIT une dérive lente (médiane de fenêtre). `av_reanchors` :
+           # il a été RELÂCHÉ parce que plus rien n'était servi — un décrochage, pas une dérive.
+           # Les confondre masquerait un régime instable derrière un compteur qui « bouge un peu ».
+           "av_relocks": 0, "av_reanchors": 0, "audio_late_samples": 0, "audio_headroom_ms": None,
+           # `av_skew_ms` : écart entre la ligne de temps DEMANDÉE (la case de la trame) et
+           # celle qui ARRIVE (tête du tampon). Zéro = les deux compteurs partagent bien leur
+           # origine. Un écart franc et stable dit que l'hypothèse d'origine commune est
+           # fausse — c'est la mesure qui tranche, pas le raisonnement.
+           "av_skew_ms": None, "av_fallback": None, "av_glisse_ms": None,
            "enabled": ENABLED, "net_in_kbps": 0.0,
            "slice_mode": bool(V_SLICE_H), "slice_h": V_SLICE_H,
            "total_slices": _V_TOTAL_SLICES}}
@@ -232,22 +306,90 @@ frame_lock = threading.Lock()
 _last_frame = None            # bytes de la dernière trame conformée reçue
 _last_frame_mono = None       # time.monotonic() de réception
 _frames_in = 0                # compteur trames reçues (fenêtre in_fps)
+# Numéro de la trame DANS SA GÉNÉRATION ffmpeg (0 = première trame sortie du filtre fps) et
+# génération d'origine. C'est ce numéro, pas l'ordre d'arrivée, qui porte la ligne de temps.
+_last_frame_no = None
+_last_frame_gen = 0
 
 audio_lock = threading.Lock()
-_audio_buf = collections.deque()   # blocs float32 (n, 8) en attente
+# Blocs en attente : (numéro cumulé du 1er échantillon, float32 (n, 8), génération ffmpeg,
+# index TAI d'arrivée). Le numéro CUMULÉ est ce qui rend le verrou A/V possible : il situe le
+# bloc sur la ligne de temps de la source, indépendamment de son rang d'arrivée. L'index
+# d'arrivée ne sert qu'à publier la marge (`audio_headroom_ms`).
+_audio_buf = collections.deque()
 _audio_buf_n = 0                   # échantillons dans _audio_buf (compteur, évite un sum() par chunk)
 # Capacité et latence sont DEUX choses distinctes. On entre et on sort à 48 kHz, donc le tampon ne
 # se vide jamais de lui-même : son occupation en régime établi EST la latence audio (retard sur la
 # vidéo). Mais ffmpeg écrit dans le fifo par rafales de plusieurs dizaines de ms : un plafond bas
 # écrête ces rafales (drops) puis affame le feeder — il faut donc de la capacité ET un drainage.
-#   MAX  : capacité dure, absorbe les rafales d'écriture de ffmpeg.
-#   HIGH : au-delà, on draine jusqu'à TARGET — une fois (rafale de démarrage), pas à chaque pic.
-# L'occupation mesurée n'oscille que de ~20 ms : HIGH−TARGET = 30 ms suffit à ne jamais déclencher
-# le drainage en régime établi, tout en gardant la latence audio à ~2 trames.
-_AUDIO_BUF_MAX    = A_SAMPLE_RATE * 200 // 1000
-_AUDIO_BUF_HIGH   = A_SAMPLE_RATE *  60 // 1000
+#   MAX    : capacité dure, absorbe les rafales d'écriture de ffmpeg.
+#   TARGET : la latence VISÉE en régime établi.
+# ⚠ Le drainage se décide sur le BAS DE L'EAU, pas sur un pic. L'ancien critère — « occupation
+# instantanée > 60 ms → vider jusqu'à 30 ms » — reposait sur l'idée que l'occupation n'oscille
+# que d'une vingtaine de ms. MESURÉ FAUX le 2026-08-23 sur une entrée en rafales : elle traverse
+# le seuil des dizaines de fois par seconde, le drainage se déclenche à chaque fois, et **83 % de
+# l'audio entrant partait au rebut** — suivi d'une famine, puisqu'on venait de jeter ce que le
+# passage suivant réclamait. Capacité et latence sont deux choses distinctes, et une occupation
+# instantanée ne mesure NI l'une NI l'autre : c'est son MINIMUM sur une fenêtre qui dit la latence
+# réellement STOCKÉE (une rafale ne descend pas le minimum, un retard installé le monte). On ne
+# jette donc que l'excédent constaté sur ce minimum, au plus une fois par fenêtre.
+# La CAPACITÉ doit dépasser la plus grosse rafale d'écriture de ffmpeg, sinon on jette le surplus
+# à l'entrée puis on affame en attendant la rafale suivante. MESURÉ le 2026-08-23 au banc sur une
+# entrée en rafales, avec un plafond à 200 ms : 40 % de l'audio jeté AU PLAFOND et 40 % des blocs
+# comblés au silence, en régime permanent — le tampon collé à 200 ms n'était pas « plein », il
+# était ÉCRÊTÉ. (L'ancien drainage, en ramenant l'occupation à 30 ms, ne faisait qu'aggraver.)
+# Le plafond passe donc à 1 s dans les DEUX régimes : c'est une capacité, pas une latence — la
+# latence, elle, est ramenée à TARGET par le drainage au bas de l'eau. Coût : 1,5 Mo.
+# VERROUILLÉ, la capacité doit en plus DÉTENIR L'AVANCE de l'audio sur sa case le temps que la
+# case arrive. MESURÉ le 2026-08-23 en rejouant le flux réel : cette avance vaut ~720 ms (la
+# branche vidéo — h264 1080p, bwdif, scale — traîne loin derrière la branche audio). Avec 1 s de
+# capacité on écrêtait ce que la case suivante allait réclamer : rejets au plafond, famine, et un
+# audio finalement posé à côté. 3 s laissent de la marge sans rien coûter d'autre que 4,5 Mo.
+_AUDIO_BUF_MAX    = A_SAMPLE_RATE * (3000 if AV_LOCK else 1000) // 1000
 _AUDIO_BUF_TARGET = A_SAMPLE_RATE *  30 // 1000
+_AUDIO_BAS_EAU_NS = 2_000_000_000          # fenêtre du bas de l'eau
+# VERROUILLÉ, ces seuils ne gouvernent plus la latence : elle vient du décalage `_av_d`, et
+# l'occupation n'est plus qu'une marge d'arrivée. Le drainage est alors DÉSARMÉ (il jetterait des
+# échantillons encore à l'heure) ; MAX reste, c'est une capacité.
 _audio_seen = False                # a-t-on déjà reçu de l'audio ? (sinon la famine est normale)
+
+# ─── verrou A/V : un seul entier ─────────────────────────────────────────────
+# `_av_d` : index TAI d'échantillon = numéro cumulé de l'échantillon + _av_d. Établi à partir
+# d'une paire (trame n, case de grille k) constatée à la présentation, remis à None à chaque
+# (re)démarrage ffmpeg — les deux compteurs repartent de zéro ensemble.
+av_lock_state = threading.Lock()
+_av_d = None                       # CIBLE : ce que dit le dernier constat de présentation
+_av_d_app = None                   # APPLIQUÉ : ce que le feeder utilise réellement
+# GLISSEMENT. Déplacer le verrou d'un coup jette (ou redemande) tout l'écart en une fois —
+# mesuré au banc : 140 ms d'audio au rebut sur UN déplacement, soit un trou franchement audible.
+# On rejoint donc la cible par pas d'UN échantillon tous les _AV_GLISSE_BLOCS blocs de 1 ms, soit
+# 0,5 % de vitesse : inaudible, et l'écart se résorbe tout seul. Le premier accrochage, lui, est
+# immédiat (rien ne joue encore, il n'y a rien à ménager).
+_AV_GLISSE_BLOCS = 4
+_av_gen = 0                        # génération ffmpeg courante (une par process, cf. superviseur)
+_av_win = []                       # mesures de D sur la fenêtre courante (cf. _av_note)
+_av_cand = None                    # médiane candidate, à confirmer sur une 2ᵉ fenêtre
+_av_win_t0 = 0
+# REPLI. Le verrou repose sur une hypothèse : les deux sorties ffmpeg partagent l'origine de
+# leur ligne de temps. Si elle est fausse, la case demandée ne rencontre jamais l'audio qui
+# arrive et la sortie devient un silence permanent — le pire des échecs, propre en apparence.
+# Au bout de _AV_FALLBACK_S sans un seul échantillon servi ALORS QUE l'audio arrive, on repasse
+# en cadencement libre (comportement d'avant la 0.9.0), on le JOURNALISE et on le publie.
+_AV_FALLBACK_S = 3.0
+# Le repli n'est pas définitif : on retente VITE. Mesuré au banc : la rafale de rattrapage qui
+# suit une (re)connexion décroche le verrou pendant une poignée de secondes ; avec 10 s d'attente
+# avant de retenter, chaque reconnexion coûtait 10 s de plus en cadencement libre pour rien.
+_AV_RETRY_S    = 2.0
+_av_fallback = None                # None = verrou en vigueur ; sinon la raison, publiée
+# RÉ-ANCRAGE RAPIDE. D n'est valable que tant que la relation « trame présentée ↔ case de
+# grille » tient. Elle ne tient PAS pendant une rafale de rattrapage (après une reconnexion
+# SRT, ffmpeg décode à 3× le temps réel : mesuré in_fps 152 pour une grille à 50) — la case
+# demandée décroche alors de l'audio qui arrive en quelques centaines de ms. Dès que plus rien
+# n'est servi pendant _AV_REANCHOR_S ALORS QUE l'audio est là, on relâche D : la prochaine
+# trame présentée le repose, sur une paire fraîche. C'est la correction lip-sync CORRECTE
+# (elle vient de la vidéo), pas un alignement opportuniste sur ce qui traîne dans le tampon.
+_AV_REANCHOR_S = 1.0
+_AV_ATTENTE_MAX_S = 2.0            # au-delà, une « attente » n'en est plus une
 
 _proc = None                  # process ffmpeg courant (supervisé)
 _proc_lock = threading.Lock()
@@ -355,6 +497,65 @@ def _grid_sleep_until(deadline_ns):
     dt = (deadline_ns - _grid_now_ns()) / 1e9
     if dt > 0: time.sleep(dt)
 
+def _tai_offset_ns():
+    """Écart horloge de la grille genlock (CLOCK_REALTIME) → horloge TAI du bus MXL.
+    Les index de grain VIDÉO sont posés depuis la grille, les index AUDIO depuis now_tai() :
+    sur un conteneur dont l'horloge n'est pas déjà en TAI, poser l'audio à la case de la
+    vidéo sans cette conversion le décalerait de l'écart TAI-UTC entier (37 s)."""
+    try:
+        return bobimxl.now_tai() - time.clock_gettime_ns(time.CLOCK_REALTIME)
+    except Exception:
+        return 0
+
+def _grid_tai_sample(k):
+    """Case de grille vidéo k → index TAI d'échantillon audio du MÊME instant."""
+    return (_grid_ns(k) + _tai_offset_ns()) * A_SAMPLE_RATE // 1_000_000_000
+
+def _av_note(gen, n, k):
+    """Constat de présentation : la trame n (de la génération gen) part à la case k.
+    Appelée à la PREMIÈRE présentation d'une trame — une trame répétée (source plus lente que
+    la grille, hoquet réseau) donnerait une mesure gonflée d'une case."""
+    global _av_d, _av_d_app, _av_win, _av_win_t0, _av_cand
+    d = _grid_tai_sample(k) - _samples_at_frame(n)
+    relock = 0
+    with av_lock_state:
+        if gen != _av_gen:
+            return                     # trame d'une génération ffmpeg périmée : ne rien bouger
+        now = _grid_now_ns()
+        if _av_d is None:
+            _av_d = d; _av_d_app = d      # premier accrochage : immédiat
+            _av_win = []; _av_win_t0 = now; relock = -1
+        else:
+            _av_win.append(d)
+            if now - _av_win_t0 >= _AV_WINDOW_NS:
+                # MÉDIANE, ni min ni moyenne. Le minimum a été essayé le 2026-08-23 et MESURÉ
+                # nuisible : il retient l'alignement le PLUS SERRÉ de la fenêtre (la trame la
+                # moins retardée), c'est-à-dire celui qui laisse zéro marge d'arrivée à
+                # l'audio — la marge observée tombait de 280 ms à −1 ms en 20 s, puis la
+                # famine s'installait. La médiane vise la présentation TYPIQUE ; la marge, elle,
+                # est un choix explicite (retenue vidéo), pas un effet de bord de l'estimateur.
+                # La moyenne, elle, suivrait chaque trame en retard.
+                _av_win.sort()
+                med = _av_win[len(_av_win) // 2]
+                # CONFIRMATION sur deux fenêtres. Une source 25p remontée en 50p arrive par
+                # paires : la médiane bascule entre deux valeurs distantes d'une trame et la
+                # phase glisse lentement — mesuré, un déplacement du verrou toutes les ~10 s,
+                # chacun un saut audible de 20 ms et 100 ms d'audio jeté. Une dérive RÉELLE,
+                # elle, tient sur deux fenêtres d'affilée : on la suit toujours, 5 s plus tard.
+                if abs(med - _av_d) > _AV_DEADBAND:
+                    if _av_cand is not None and abs(med - _av_cand) <= _AV_DEADBAND:
+                        _av_d = med; relock = 1; _av_cand = None
+                    else:
+                        _av_cand = med
+                else:
+                    _av_cand = None
+                _av_win = []; _av_win_t0 = now
+    if relock:
+        with metrics_lock:
+            metrics["av_locked"] = True
+            if relock > 0:
+                metrics["av_relocks"] += 1
+
 def _split_fields(full_b):
     """TRAME planar pleine → (champ_1er, champ_2nd). tff → 1er champ = lignes paires."""
     bff = FIELD_ORDER == "bff"
@@ -444,12 +645,18 @@ def _input_url():
                                             s["rtmp_key"] or "stream")
     return s["url"]   # rtmp_pull : URL fournie telle quelle
 
-def _ffmpeg_cmd(with_audio=True):
+def _ffmpeg_cmd(with_audio, fifo_path):
     # bwdif deint=interlaced : ne désentrelace QUE les trames marquées entrelacées (passthrough
     # sinon) → chaîne unique quel que soit le flux entrant. fps=grille de sortie (cadence TRAME).
+    # start_time=0 (verrou A/V) : la trame n est posée au pts source n·D/N ABSOLU, par
+    # remplissage/rognage en tête — le symétrique exact du `first_pts=0` de l'audio. Sans lui,
+    # la trame 0 vaut le premier pts VIDÉO tandis que l'échantillon 0 vaut le pts 0 : l'écart
+    # de démarrage entre les deux pistes (l'audio ouvre presque toujours avant la vidéo)
+    # deviendrait une erreur de lip-sync CONSTANTE, et invisible.
+    _fps = "fps=%d/%d%s" % (FPS_NUM, FPS_DEN, ":start_time=0" if AV_LOCK else "")
     vf = ("bwdif=mode=send_frame:parity=auto:deint=interlaced,"
-          "scale=%d:%d:flags=bicubic,fps=%d/%d,format=%s,setsar=1"
-          % (WIDTH, HEIGHT, FPS_NUM, FPS_DEN, PIX_FMT))
+          "scale=%d:%d:flags=bicubic,%s,format=%s,setsar=1"
+          % (WIDTH, HEIGHT, _fps, PIX_FMT))
     # -loglevel info : nécessaire pour lire le format réel de la source (lignes « Stream #0:x »).
     # -nostats : à ce niveau ffmpeg écrirait ses lignes de progression en \r sur stderr, ce qui
     # ferait bloquer le readline du drain jusqu'au prochain \n.
@@ -468,13 +675,20 @@ def _ffmpeg_cmd(with_audio=True):
         # rafales plus grosses que la latence visée → écrêtage puis famine côté feeder.
         cmd += ["-map", "0:a:0?", "-af", "aresample=async=1:first_pts=0",
                 "-ac", str(A_CHANNELS), "-ar", str(A_SAMPLE_RATE),
-                "-f", "f32le", "-flush_packets", "1", "-y", AUDIO_FIFO]
+                "-f", "f32le", "-flush_packets", "1", "-y", fifo_path]
+    if TAP_UDP:
+        # Sortie SUPPLÉMENTAIRE en copie de flux : ni décodage ni ré-encodage, donc les pts sont
+        # ceux de la source, intacts. UDP et non SRT : sans destinataire, on écrit dans le vide,
+        # ce qui ne peut pas faire tomber les deux autres sorties.
+        cmd += ["-map", "0:v:0", "-map", "0:a:0?", "-c", "copy",
+                "-f", "mpegts", "udp://%s?pkt_size=1316" % TAP_UDP]
     return cmd
 
 # ─── lecteurs de sortie ffmpeg (ne bloquent jamais le feeder) ────────────────
-def _video_reader(proc):
-    global _last_frame, _last_frame_mono, _frames_in
+def _video_reader(proc, gen):
+    global _last_frame, _last_frame_mono, _frames_in, _last_frame_no, _last_frame_gen
     buf = bytearray()
+    n = 0                              # numéro de trame DANS CETTE génération (0 = pts 0)
     stdout = proc.stdout
     while proc.poll() is None:
         try:
@@ -490,48 +704,57 @@ def _video_reader(proc):
                 _last_frame = fb
                 _last_frame_mono = time.monotonic()
                 _frames_in += 1
+                _last_frame_no = n
+                _last_frame_gen = gen
+            n += 1
 
 def _audio_seen_set():
     global _audio_seen
     _audio_seen = True
 
-def _audio_reader():
-    """Ouvre le fifo audio en boucle (rendez-vous bloquant OK : thread dédié, jamais sur le chemin
-    vidéo). Blocs f32le 8ch → deque bornée consommée par audio_feeder."""
+def _audio_reader(gen, path):
+    """Une session de lecture par génération ffmpeg (rendez-vous bloquant OK : thread dédié,
+    jamais sur le chemin vidéo). Blocs f32le 8ch → deque bornée consommée par audio_feeder,
+    chacun étiqueté de son numéro CUMULÉ (0 = pts 0, cf. first_pts=0) et de sa génération.
+    Le thread se termine quand plus personne n'écrit : le superviseur « sonne » le fifo après
+    la mort de ffmpeg, ce qui débloque un open() resté en attente (flux sans piste audio)."""
     global _audio_buf_n
     blk = A_SPMS * A_CHANNELS * 4 * 10          # 10 ms
     win_n = 0; win_t0 = time.monotonic()
-    while True:
-        try:
-            with open(AUDIO_FIFO, "rb") as f:
-                while True:
-                    data = f.read(blk)
-                    if not data:
-                        break                    # ffmpeg (écrivain) parti → réouvrir
-                    n = len(data) // (A_CHANNELS * 4)
-                    if n <= 0: continue
-                    arr = np.frombuffer(data, dtype=np.float32,
-                                        count=n * A_CHANNELS).reshape(n, A_CHANNELS)
-                    _audio_seen_set()
-                    dropped = 0
-                    with audio_lock:
-                        _audio_buf.append(arr); _audio_buf_n += n
-                        while _audio_buf_n > _AUDIO_BUF_MAX and _audio_buf:
-                            d = _audio_buf.popleft().shape[0]
-                            _audio_buf_n -= d; dropped += d
-                        tot = _audio_buf_n
-                    win_n += n
-                    el = time.monotonic() - win_t0
-                    with metrics_lock:
-                        if dropped:
-                            metrics["audio_drop_samples"] += dropped
-                        metrics["audio_buf_ms"] = round(tot / float(A_SPMS), 1)
-                        if el >= 1.0:
-                            metrics["audio_in_sps"] = round(win_n / el)
+    cum = 0
+    try:
+        with open(path, "rb") as f:
+            while True:
+                data = f.read(blk)
+                if not data:
+                    break                        # tous les écrivains partis → fin de session
+                n = len(data) // (A_CHANNELS * 4)
+                if n <= 0: continue
+                arr = np.frombuffer(data, dtype=np.float32,
+                                    count=n * A_CHANNELS).reshape(n, A_CHANNELS)
+                _audio_seen_set()
+                ai = _tai_sample_index()
+                dropped = 0
+                with audio_lock:
+                    _audio_buf.append((cum, arr, gen, ai)); _audio_buf_n += n
+                    while _audio_buf_n > _AUDIO_BUF_MAX and _audio_buf:
+                        d = _audio_buf.popleft()[1].shape[0]
+                        _audio_buf_n -= d; dropped += d
+                    tot = _audio_buf_n
+                cum += n
+                win_n += n
+                el = time.monotonic() - win_t0
+                with metrics_lock:
+                    if dropped:
+                        metrics["audio_drop_samples"] += dropped
+                        metrics["audio_drop_plafond"] += dropped
+                    metrics["audio_buf_ms"] = round(tot / float(A_SPMS), 1)
                     if el >= 1.0:
-                        win_n = 0; win_t0 = time.monotonic()
-        except Exception:
-            time.sleep(0.5)
+                        metrics["audio_in_sps"] = round(win_n / el)
+                if el >= 1.0:
+                    win_n = 0; win_t0 = time.monotonic()
+    except Exception as e:
+        log("audio: session %d interrompue : %s" % (gen, e), "warning")
 
 def _stderr_drain(proc):
     """ffmpeg tourne en -loglevel info : on y pêche le format RÉEL de la source (lignes
@@ -608,8 +831,24 @@ def history_sampler():
                           "off": 1 if conn == "off" else 0}})
 
 # ─── superviseur ffmpeg (poll + restart, backoff) ────────────────────────────
+def _fifo_close(path, had_audio):
+    """Fin de session audio : on « sonne » le fifo (ouverture en écriture puis fermeture) pour
+    débloquer un lecteur resté en attente d'un écrivain — ffmpeg peut mourir sans jamais avoir
+    ouvert le fifo (flux sans piste audio, échec au démarrage), et le thread resterait pendu
+    sur open() pour toujours. ENXIO = plus de lecteur, il n'y a rien à débloquer."""
+    if not had_audio:
+        return
+    try:
+        os.close(os.open(path, os.O_WRONLY | os.O_NONBLOCK))
+    except Exception:
+        pass
+    try:
+        os.unlink(path)     # le lecteur garde l'inode ouvert le temps de vider ce qui reste
+    except Exception:
+        pass
+
 def supervisor():
-    global _proc
+    global _proc, _av_gen, _av_d, _av_d_app, _av_win, _av_cand, _av_fallback
     restarts = 0
     # Gel prolongé en caller/pull = connexion zombie → kill (le restart re-tente). Les modes
     # écoute (listener/server) restent en attente passive, pas de stall-kill.
@@ -622,15 +861,36 @@ def supervisor():
                 globals()["_last_frame_mono"] = None
             _enabled.wait()
             _src_fmt["video"] = _src_fmt["audio"] = None
+        # Nouvelle GÉNÉRATION : les deux compteurs (trames, échantillons) repartent de zéro
+        # ENSEMBLE, et le verrou A/V est relâché — il se réaccroche sur la première trame
+        # présentée. C'est le seul endroit où la génération avance.
+        with av_lock_state:
+            _av_gen += 1; gen = _av_gen
+            _av_d = None; _av_d_app = None; _av_win = []; _av_cand = None
+            _av_fallback = None       # nouvelle génération = nouvelle chance d'accrocher
+        with metrics_lock:
+            metrics["av_locked"] = False
+            metrics["av_fallback"] = None
+            metrics["av_skew_ms"] = None
+        fifo = _audio_fifo_path(gen)
+        if with_audio:
+            try:
+                os.mkfifo(fifo)
+            except FileExistsError:
+                pass
+            except Exception as e:
+                _stderr_tail.append("mkfifo: %s" % e)
+            threading.Thread(target=_audio_reader, args=(gen, fifo), daemon=True).start()
         try:
-            proc = subprocess.Popen(_ffmpeg_cmd(with_audio), stdout=subprocess.PIPE,
+            proc = subprocess.Popen(_ffmpeg_cmd(with_audio, fifo), stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE, bufsize=V_FRAME_SIZE)
         except Exception as e:
             _stderr_tail.append("spawn: %s" % e)
+            _fifo_close(fifo, with_audio)
             time.sleep(2); continue
         with _proc_lock:
             _proc = proc
-        threading.Thread(target=_video_reader, args=(proc,), daemon=True).start()
+        threading.Thread(target=_video_reader, args=(proc, gen), daemon=True).start()
         threading.Thread(target=_stderr_drain, args=(proc,), daemon=True).start()
         got_any = False
         while proc.poll() is None:
@@ -655,6 +915,7 @@ def supervisor():
         except Exception:
             try: proc.kill()
             except Exception: pass
+        _fifo_close(fifo, with_audio)
         restarts += 1
         with metrics_lock:
             metrics["ffmpeg_restarts"] = restarts
@@ -672,12 +933,13 @@ def supervisor():
 
 # ─── feeder vidéo genlock (MAÎTRE : une trame par tick, toujours) ────────────
 def video_feeder():
-    global _last_frame_mono
     shm = bobimxl.Writer(inst, VIDEO_SHM, WIDTH, HEIGHT, CHROMA, BIT_DEPTH, FPS_NUM, FPS_DEN,
                          interlace=SCAN,
                          **_SLICE_KW)
     idx = 0
     last_conn = None
+    hold = collections.deque()        # trames retenues (AV_MARGIN_FRAMES cases)
+    last_noted = (None, None)         # (génération, n° de trame) déjà porté au verrou
     period_ns = round(1e9 * FPS_DEN / FPS_NUM)
     kf = _grid_k(_grid_now_ns()) + 2
     win_cnt = 0; win_t0 = _grid_now_ns(); win_max_gap = 0; last_w = win_t0
@@ -704,11 +966,22 @@ def video_feeder():
             time.sleep(max(0.0, period_ns / 1e9))
         with frame_lock:
             frame = _last_frame; lm = _last_frame_mono; fin = _frames_in
+            fno = _last_frame_no; fgen = _last_frame_gen
         age_ms = None if lm is None else (time.monotonic() - lm) * 1000.0
+        # RETENUE : on présente la trame qui était la plus fraîche AV_MARGIN_FRAMES cases plus
+        # tôt, pour rendre au chemin audio la marge d'arrivée que le verrou lui retire. L'état
+        # de connexion, lui, se juge sur l'arrivée COURANTE : la retenue décale l'image, elle
+        # ne doit pas vieillir le diagnostic ni déclencher un faux gel.
+        if AV_MARGIN_FRAMES:
+            hold.append((frame, fno, fgen))
+            shown, fno, fgen = hold.popleft() if len(hold) > AV_MARGIN_FRAMES \
+                               else (None, None, None)
+        else:
+            shown = frame
         if not _enabled.is_set():
-            frame = IDLE_FRAME; conn = "off"
-        elif frame is None:
-            frame = IDLE_FRAME; conn = "waiting"
+            shown = IDLE_FRAME; conn = "off"
+        elif frame is None or shown is None:
+            shown = IDLE_FRAME; conn = "waiting"
         elif age_ms is not None and age_ms > FREEZE_TIMEOUT_MS:
             conn = "frozen"
         else:
@@ -721,7 +994,14 @@ def video_feeder():
                     src_fmt=(_src_fmt.get("video") or None),
                     frame_age_ms=(None if age_ms is None else round(age_ms)))
             last_conn = conn
-        _write_video(shm, frame, kf); idx += 1
+        _write_video(shm, shown, kf); idx += 1
+        # Constat porté au verrou A/V à la PREMIÈRE présentation d'une trame : une trame
+        # répétée (source plus lente que la grille, hoquet réseau) partirait une case plus
+        # tard et gonflerait la mesure. Rien n'est noté sur une mire ou une trame gelée : ce
+        # n'est pas la source qui cadence.
+        if AV_LOCK and conn == "connected" and fno is not None and (fgen, fno) != last_noted:
+            last_noted = (fgen, fno)
+            _av_note(fgen, fno, kf)
         now = _grid_now_ns()
         gap = now - last_w; last_w = now
         if gap > win_max_gap: win_max_gap = gap
@@ -760,63 +1040,243 @@ A_MAX_LAG = A_SAMPLE_RATE // 4           # 250 ms de dérive tolérée avant ré
 def _tai_sample_index():
     return bobimxl.now_tai() * A_SAMPLE_RATE // 1_000_000_000
 
-def audio_feeder():
+def _fill_locked(want, out):
+    """Remplit `out` avec les échantillons de numéros CUMULÉS [want, want+A_BLK) : la case de
+    grille et le contenu sont liés par la ligne de temps de la source, plus par l'ordre
+    d'arrivée. Renvoie (utiles, jetés en retard, index TAI d'arrivée du 1er bloc servi)."""
     global _audio_buf_n
+    got = 0; late = 0; arrived = None; tete = None
+    with audio_lock:
+        if _audio_buf:
+            tete = _audio_buf[0][0]
+        while _audio_buf:                       # sa case est passée : arrivé trop tard
+            s0, arr, _g, _ai = _audio_buf[0]
+            if s0 + arr.shape[0] <= want:
+                _audio_buf.popleft(); _audio_buf_n -= arr.shape[0]; late += arr.shape[0]
+            else:
+                break
+        while got < A_BLK and _audio_buf:
+            s0, arr, g, ai = _audio_buf[0]
+            if s0 > want + got:                 # pas encore arrivé → trou, complété en silence
+                break
+            off = want + got - s0
+            take = min(A_BLK - got, arr.shape[0] - off)
+            out[got:got + take] = arr[off:off + take]
+            if arrived is None: arrived = ai
+            got += take
+            if off + take >= arr.shape[0]:
+                _audio_buf.popleft(); _audio_buf_n -= arr.shape[0]
+            else:                               # le bloc a encore de la matière pour la suite
+                _audio_buf[0] = (s0 + off + take, arr[off + take:], g, ai)
+                _audio_buf_n -= (off + take)
+    return got, late, arrived, (None if tete is None else tete - want)
+
+def audio_feeder():
+    global _audio_buf_n, _av_d, _av_d_app, _av_win, _av_cand, _av_fallback
     aw = bobimxl.AudioWriter(inst, AUDIO_SHM, channels=A_CHANNELS, sample_rate=A_SAMPLE_RATE)   # l'index est fourni explicitement à write()
     silence = np.zeros((A_BLK, A_CHANNELS), dtype=np.float32)
-    pending = None                        # reliquat du bloc en cours
+    out = np.empty((A_BLK, A_CHANNELS), dtype=np.float32)
+    pending = None                        # reliquat du bloc en cours (chemin LIBRE seulement)
     next_idx = _tai_sample_index() - A_BLK
+    hw_min = None; hw_t0 = _grid_now_ns()          # fenêtre 1 s de la marge d'arrivée
+    served_t = time.monotonic()                    # dernier échantillon RÉELLEMENT servi
+    fallback_t = None                              # date du repli, pour le retenter
+    dernier_ecart = None                           # écart de tête du dernier bloc verrouillé
+    glisse_n = 0                                   # compteur de blocs du glissement
+    cible = None
+    bas_eau = 0; bas_t0 = _grid_now_ns()           # bas de l'eau du tampon (cf. drainage)
+    latence_ms = None
     while True:
         cur = _tai_sample_index()
-        # Drainage : l'occupation du tampon est la latence audio. Au-delà du seuil haut (rafale
-        # de démarrage, hoquet réseau) on retombe d'un coup sur la cible plutôt que de traîner
-        # ce retard indéfiniment. Les pics normaux (< HIGH) ne déclenchent rien : pas de thrash.
-        drained = 0
-        with audio_lock:
-            if _audio_buf_n > _AUDIO_BUF_HIGH:
-                while _audio_buf_n > _AUDIO_BUF_TARGET and _audio_buf:
-                    d = _audio_buf.popleft().shape[0]
-                    _audio_buf_n -= d; drained += d
-                pending = None
-        if drained:
+        with av_lock_state:
+            # TROIS régimes, pas deux. Les confondre a coûté une sortie MUETTE pendant tout le
+            # repli (mesuré : ~1000 blocs de silence par seconde là où le repli devait rendre
+            # exactement le comportement d'avant la 0.9.0).
+            #   "libre"   — verrou désactivé ou en repli : on débite au fil de l'eau
+            #   "attente" — verrou demandé, pas encore accroché : silence cadencé, volontaire
+            #   "verrou"  — D établi : on tire par la ligne de temps
+            gen = _av_gen
+            if not AV_LOCK or _av_fallback:
+                regime = "libre"; d = None
+            elif _av_d is None:
+                regime = "attente"; d = None
+            else:
+                regime = "verrou"; d = _av_d_app; cible = _av_d
+        # Le repli n'est pas une condamnation : on retente le verrou périodiquement. Une rafale
+        # de rattrapage passe ; une hypothèse fausse, elle, se reverra dans `av_skew_ms`.
+        if _av_fallback and fallback_t and time.monotonic() - fallback_t > _AV_RETRY_S:
+            with av_lock_state:
+                _av_fallback = None
+                _av_d = None
             with metrics_lock:
-                metrics["audio_drop_samples"] += drained
-        # Dérive : l'horloge de la SOURCE n'est pas la grille TAI. Trop en retard (backlog) ou
-        # trop en avance (écriture dans le futur) → on ré-ancre, un seul saut plutôt qu'un
-        # décalage qui s'accumule.
+                metrics["av_fallback"] = None
+            journal("av_retry")
+            fallback_t = None; served_t = time.monotonic()
+        drained = 0; stale = 0
+        with audio_lock:
+            # Reliquat d'une génération ffmpeg périmée (le fifo est par génération : un bloc
+            # d'une autre ne peut être qu'antérieur). L'écrire poserait l'audio d'AVANT une
+            # reconnexion sur la ligne de temps d'APRÈS.
+            while _audio_buf and _audio_buf[0][2] != gen:
+                a = _audio_buf.popleft()[1]
+                _audio_buf_n -= a.shape[0]; stale += a.shape[0]
+            if stale:
+                pending = None
+            # Drainage : SANS verrou seulement, là où l'occupation du tampon EST la latence
+            # audio. Verrouillé, la latence vient de `_av_d` et l'occupation n'est plus qu'une
+            # marge d'arrivée : la jeter créerait la famine qu'on cherche justement à éviter.
+            # Le critère est le BAS DE L'EAU sur la fenêtre écoulée (cf. en-tête) : une rafale ne
+            # le descend pas, un retard installé le monte. On ne jette que l'excédent constaté.
+            if regime == "libre":
+                if _audio_buf_n < bas_eau:
+                    bas_eau = _audio_buf_n
+                if _grid_now_ns() - bas_t0 >= _AUDIO_BAS_EAU_NS:
+                    trop = bas_eau - _AUDIO_BUF_TARGET
+                    while trop > 0 and _audio_buf:
+                        s0, arr, g, ai = _audio_buf[0]
+                        if arr.shape[0] <= trop:
+                            _audio_buf.popleft()
+                            _audio_buf_n -= arr.shape[0]
+                            drained += arr.shape[0]; trop -= arr.shape[0]
+                        else:              # ne jeter QUE l'excédent, pas le bloc entier
+                            _audio_buf[0] = (s0 + trop, arr[trop:], g, ai)
+                            _audio_buf_n -= trop; drained += trop; trop = 0
+                    if drained:
+                        pending = None
+                    latence_ms = bas_eau / float(A_SPMS)
+                    bas_eau = _audio_buf_n; bas_t0 = _grid_now_ns()
+            else:
+                bas_eau = _audio_buf_n; bas_t0 = _grid_now_ns()
+        if latence_ms is not None:
+            with metrics_lock:
+                metrics["audio_latence_ms"] = round(latence_ms, 1)
+            latence_ms = None
+        if drained or stale:
+            with metrics_lock:
+                metrics["audio_drop_samples"] += drained + stale
+                metrics["audio_drop_drainage"] += drained
+                metrics["audio_drop_generation"] += stale
+        # Pacing : `next_idx` suit la grille TAI dans LES DEUX régimes — c'est le contrat de
+        # granularité 1 ms avec les consommateurs, indépendant du choix du contenu. Trop loin
+        # derrière ou devant (stall système) → un seul saut, pas un décalage qui s'accumule.
         if abs(cur - next_idx) > A_MAX_LAG:
             next_idx = cur - A_BLK
-            with audio_lock:
-                _audio_buf.clear(); _audio_buf_n = 0
+            if regime == "libre":
+                with audio_lock:
+                    perdu = _audio_buf_n
+                    _audio_buf.clear(); _audio_buf_n = 0
+                with metrics_lock:
+                    metrics["audio_drop_samples"] += perdu
+                    metrics["audio_drop_reancrage"] += perdu
             pending = None
             with metrics_lock:
                 metrics["audio_reanchors"] += 1
         while next_idx + A_BLK <= cur:
-            need = A_BLK
-            out = np.empty((A_BLK, A_CHANNELS), dtype=np.float32); pos = 0
-            with audio_lock:
-                while need > 0:
-                    if pending is not None and len(pending):
-                        take = min(need, len(pending))
-                        out[pos:pos + take] = pending[:take]
-                        pending = pending[take:] if take < len(pending) else None
-                        pos += take; need -= take
-                    elif _audio_buf:
-                        pending = _audio_buf.popleft()
-                        _audio_buf_n -= pending.shape[0]
-                    else:
-                        break
-            if need > 0:                  # pas assez de frais → compléter en silence
-                if pos == 0:
-                    out = silence
-                else:
-                    out[pos:] = 0.0
-                if _audio_seen:          # avant le 1er échantillon, le silence est normal
+            starve = False
+            if regime == "verrou" and cible is not None and d != cible:
+                glisse_n += 1
+                if glisse_n >= _AV_GLISSE_BLOCS:
+                    glisse_n = 0
+                    d += 1 if cible > d else -1
+                    with av_lock_state:
+                        _av_d_app = d
+            if regime == "attente":
+                # Verrou demandé, pas encore accroché (aucune trame présentée depuis le
+                # démarrage de ffmpeg) : silence cadencé, plutôt qu'un audio posé au hasard
+                # qu'il faudrait ensuite déplacer.
+                blk = silence; starve = _audio_seen
+            elif regime == "verrou":
+                got, late, arrived, ecart = _fill_locked(next_idx - d, out)
+                if got < A_BLK:
+                    out[got:] = 0.0
+                    starve = _audio_seen
+                blk = out
+                if late:
                     with metrics_lock:
-                        metrics["audio_starve_blocks"] += 1
-            try: aw.write(out, index=next_idx)
+                        metrics["audio_late_samples"] += late
+                if arrived is not None:
+                    hm = (next_idx - arrived) / float(A_SPMS)
+                    if hw_min is None or hm < hw_min: hw_min = hm
+                if got:
+                    served_t = time.monotonic()
+                dernier_ecart = ecart
+            else:
+                need = A_BLK; pos = 0
+                with audio_lock:
+                    while need > 0:
+                        if pending is not None and len(pending):
+                            take = min(need, len(pending))
+                            out[pos:pos + take] = pending[:take]
+                            pending = pending[take:] if take < len(pending) else None
+                            pos += take; need -= take
+                        elif _audio_buf:
+                            pending = _audio_buf.popleft()[1]
+                            _audio_buf_n -= pending.shape[0]
+                        else:
+                            break
+                blk = out
+                if need > 0:                  # pas assez de frais → compléter en silence
+                    if pos == 0:
+                        blk = silence
+                    else:
+                        out[pos:] = 0.0
+                    starve = _audio_seen
+            try: aw.write(blk, index=next_idx)
             except Exception: pass
+            if starve:                        # avant le 1er échantillon, le silence est normal
+                with metrics_lock:
+                    metrics["audio_starve_blocks"] += 1
             next_idx += A_BLK
+        now = _grid_now_ns()
+        if now - hw_t0 >= 1_000_000_000:
+            # MINIMUM de la fenêtre, pas moyenne : c'est le bloc le PLUS juste arrivé qui dit
+            # combien de marge il reste avant que la famine commence.
+            skew = None
+            with audio_lock:
+                tete = _audio_buf[0][0] if _audio_buf else None
+            if d is not None and tete is not None:
+                skew = round((tete - (next_idx - d)) / float(A_SPMS), 1)
+            with metrics_lock:
+                metrics["audio_headroom_ms"] = None if hw_min is None else round(hw_min, 1)
+                metrics["av_skew_ms"] = skew
+                # Reste à résorber : non nul = un déplacement de verrou est en cours d'absorption,
+                # sans trou.
+                metrics["av_glisse_ms"] = (None if (d is None or cible is None)
+                                           else round((cible - d) / float(A_SPMS), 1))
+            hw_min = None; hw_t0 = now
+        # Rien n'est servi alors que l'audio est là. Deux situations se ressemblent ici et
+        # n'ont RIEN à voir — c'est le SIGNE de l'écart de tête qui les sépare :
+        #   écart > 0 : la case réclame de l'audio PAS ENCORE ARRIVÉ. C'est une attente NORMALE,
+        #     bornée (écart/48 ms), et c'est le cas de tout accrochage : le verrou se pose sur
+        #     une trame dont l'audio est encore en vol. Ré-ancrer ici est exactement la mauvaise
+        #     réponse — mesuré : 10 s de silence à chaque reconnexion, et 83 % de l'audio jeté.
+        #   écart ≤ 0 : la case a DÉPASSÉ ce qui arrive, et ce qui arrive part au rebut. Là, la
+        #     paire (trame, case) est vraiment périmée et il faut la refaire.
+        # Garde-fou : une attente de plus de _AV_ATTENTE_MAX_S n'est plus une attente.
+        attente = (dernier_ecart is not None and dernier_ecart > 0
+                   and dernier_ecart < _AV_ATTENTE_MAX_S * A_SAMPLE_RATE)
+        if (d is not None and _audio_seen and _audio_buf and not attente
+                and time.monotonic() - served_t > _AV_REANCHOR_S):
+            mort = time.monotonic() - served_t
+            if mort > _AV_FALLBACK_S:
+                # Ré-ancrer ne suffit pas : sur cette source, la case demandée ne rencontre
+                # jamais l'audio qui arrive. On ne reste pas muet — cadencement libre, dit et
+                # publié, et retenté dans _AV_RETRY_S.
+                _av_fallback = (
+                    "aucun échantillon servi en %.1f s malgré les ré-ancrages (écart %s ms) — "
+                    "cadencement libre" % (mort, metrics.get("av_skew_ms")))
+                with metrics_lock:
+                    metrics["av_fallback"] = _av_fallback
+                    metrics["av_locked"] = False
+                journal("av_fallback", raison=_av_fallback, skew_ms=metrics.get("av_skew_ms"))
+                log("verrou A/V : %s" % _av_fallback, "warning")
+                fallback_t = time.monotonic(); served_t = fallback_t
+            else:
+                with av_lock_state:
+                    _av_d = None; _av_d_app = None; _av_win = []; _av_cand = None      # la prochaine trame repose D
+                with metrics_lock:
+                    metrics["av_reanchors"] += 1
+                served_t = time.monotonic() - _AV_REANCHOR_S / 2.0   # laisse le temps de reposer
         # Période < 1 ms : un seul bloc par passage, donc head_index avance de façon CONTINUE.
         # Dormir plus longtemps ferait avancer la tête par paquets et rouvrirait la fenêtre
         # d'injection de silence chez le consommateur (cf. contrat 1 ms ci-dessus).
@@ -876,6 +1336,8 @@ def _state_payload():
               "chroma": CHROMA, "bit_depth": BIT_DEPTH, "scan": _SCAN_CFG,
               "mode": MODE, "idle_mode": IDLE_MODE,
               "freeze_timeout_ms": FREEZE_TIMEOUT_MS, "genlock": GENLOCK,
+              "av_lock": AV_LOCK, "av_margin_frames": AV_MARGIN_FRAMES, "tap_udp": TAP_UDP,
+              "av_fallback": _av_fallback,
               "source_format": dict(_src_fmt),
               "journal_persistent": JOURNAL_PERSISTENT,
               "log_level": LOG_LEVEL,   # lisible en condition de macro
@@ -968,18 +1430,23 @@ class ControlHandler(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
 
 # ─── boot ────────────────────────────────────────────────────────────────────
+# Fifos d'un run précédent (le rootfs peut survivre à un simple redémarrage du script) : les
+# numéros de génération repartent de 0, un fifo laissé en place serait réutilisé par la
+# nouvelle génération du même numéro. On fait place nette.
 try:
-    if os.path.exists(AUDIO_FIFO): os.unlink(AUDIO_FIFO)
-    os.mkfifo(AUDIO_FIFO)
+    import glob as _glob
+    for _f in _glob.glob("%s/stream_in_audio.*.f32" % AUDIO_FIFO_DIR):
+        try: os.unlink(_f)
+        except Exception: pass
 except Exception:
     pass
 
 journal("script_start", version=PLUGIN_VERSION, mode=MODE, enabled=ENABLED,
-        out_format="%dx%d%s%d" % (WIDTH, HEIGHT, _SCAN_CFG, FPS))
+        out_format="%dx%d%s%d" % (WIDTH, HEIGHT, _SCAN_CFG, FPS),
+        av_lock=AV_LOCK, av_margin_frames=AV_MARGIN_FRAMES)
 
 threading.Thread(target=lambda: HTTPServer(("0.0.0.0", 8080), MetricsHandler).serve_forever(), daemon=True).start()
 threading.Thread(target=lambda: HTTPServer(("0.0.0.0", 8082), ControlHandler).serve_forever(), daemon=True).start()
-threading.Thread(target=_audio_reader, daemon=True).start()
 threading.Thread(target=supervisor, daemon=True).start()
 threading.Thread(target=history_sampler, daemon=True).start()
 threading.Thread(target=video_feeder, daemon=True).start()

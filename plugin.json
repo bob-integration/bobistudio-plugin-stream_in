@@ -3,7 +3,7 @@
   "label": "Stream In",
   "runtime": "docker",
   "image": "media",
-  "version": "0.8.0",
+  "version": "0.9.13",
   "script_template": "script.py",
   "ui": {
     "control_html": "control.html",
@@ -42,7 +42,10 @@
     "idle_mode": "bars",
     "freeze_timeout_ms": 1000,
     "enabled": true,
-    "log_level": "info"
+    "log_level": "info",
+    "av_lock": false,
+    "av_margin_frames": 1,
+    "tap_udp": ""
   },
   "config_schema": [
     {
@@ -120,6 +123,27 @@
       "scope": "system"
     },
     {
+      "key": "av_lock",
+      "type": "checkbox",
+      "label": "Verrouillage A/V (ligne de temps de la source)",
+      "default": false,
+      "help": "⚠ DÉSACTIVÉ PAR DÉFAUT. L'audio est écrit à la case de grille de la trame qui lui correspond, déduite des pts de la source. Mesuré le 2026-08-23 sur liaison SRT réelle, le verrou fait PIRE que pas de verrou : écart A/V +275 ms au lieu de +38, et âge audio moins stable. Deux défauts connus (erreur d'origine d'environ 270 ms, verrou qui se déplace trop souvent) — voir TODO.md. Ne l'activer que pour travailler dessus, pas en production.",
+      "scope": "system"
+    },
+    {
+      "key": "av_margin_frames",
+      "type": "number",
+      "label": "Retenue vidéo (trames)",
+      "min": 0,
+      "max": 10,
+      "default": 1,
+      "help": "Verrouiller l'audio sur l'instant de présentation vidéo lui retire sa marge d'arrivée : tout bloc en retard devient du silence. La vidéo est présentée N trames plus tard — les DEUX essences décalées d'autant — pour la lui rendre. NE PAS régler à l'estime : la marge réellement disponible varie d'une session ffmpeg à l'autre (mesuré le 2026-08-23 : +255 ms sur une session, ~0 sur une autre, pour la même liaison). C'est « marge audio » sur la page du plugin qui décide — elle doit rester franchement positive. 0 = aucune retenue.",
+      "visible_if": {
+        "av_lock": true
+      },
+      "scope": "system"
+    },
+    {
       "key": "idle_mode",
       "type": "select",
       "label": "Image sans flux",
@@ -168,6 +192,14 @@
       "visible_if": {
         "slice_mode": true
       }
+    },
+    {
+      "key": "tap_udp",
+      "type": "text",
+      "label": "Dérivation du flux entrant (diagnostic)",
+      "placeholder": "hôte:port — vide = désactivé",
+      "help": "ffmpeg recopie le flux REÇU, sans transcodage, vers cette adresse UDP. Le flux arrive par une connexion SRT à consommateur unique : c'est le seul moyen d'inspecter ce qu'on reçoit vraiment (relation A/V des pts, cadence annoncée, structure GOP), et une mesure prise après notre propre chaîne ne distingue pas ce qui vient de la source de ce qu'on a ajouté. À laisser VIDE hors diagnostic — c'est du débit réseau en plus.",
+      "scope": "system"
     },
     {
       "key": "log_level",
@@ -340,6 +372,13 @@
       "endpoint": "/state",
       "path": "fps",
       "type": "number"
+    },
+    {
+      "id": "av_locked",
+      "label": "Verrou A/V accroché",
+      "endpoint": "/state",
+      "path": "av_locked",
+      "type": "bool"
     }
   ],
   "param_tree": {

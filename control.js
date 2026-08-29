@@ -119,7 +119,7 @@ window.MXLPlugins.stream_in = (function () {
                  + `<input class="si-seg" data-src="rtmp_key" type="text" value="${esc(s.rtmp_key || '')}"
                        placeholder="stream" aria-label="${esc(t('plugin.stream_in.rtmp_key_aria'))}">`;
         }
-        const ph = s.mode === 'srt_caller' ? 'srt://hôte:port' : 'rtmp://hôte/app/clé';
+        const ph = s.mode === 'srt_caller' ? t('plugin.stream_in.ph_srt') : t('plugin.stream_in.ph_rtmp');
         return `<input class="si-url" data-src="url" type="text" value="${esc(s.url || '')}"
                    placeholder="${ph}" aria-label="${esc(t('plugin.stream_in.url_aria'))}">`;
     }
@@ -432,7 +432,17 @@ window.MXLPlugins.stream_in = (function () {
     }
 
     function statsHtml(s) {
-        const audioBad = s.audio_starve_blocks > 0 || s.audio_drop_samples > 0 || s.audio_reanchors > 0;
+        const avLate = (s.audio_late_samples || 0) > 0;
+        const avUnlocked = !!s.av_lock && (!s.av_locked || !!s.av_fallback);
+        const audioBad = s.audio_starve_blocks > 0 || s.audio_drop_samples > 0
+            || s.audio_reanchors > 0 || avLate || avUnlocked;
+        // Un verrou DEMANDÉ mais jamais accroché est le cas qu'il faut voir : on n'affiche
+        // donc pas l'état de la case à cocher, mais celui du décalage réellement établi.
+        const avTxt = !s.av_lock ? t('plugin.stream_in.av_off')
+            : (s.av_locked
+                ? t('plugin.stream_in.av_on').replace('{n}', s.av_margin_frames)
+                : (s.av_fallback ? t('plugin.stream_in.av_repli') + ' — ' + s.av_fallback
+                                 : t('plugin.stream_in.av_waiting')));
         const cell = (v, lbl, warn) =>
             `<div class="si-stat${warn ? ' warn' : ''}"><b>${esc(v)}</b><small>${esc(lbl)}</small></div>`;
         return `
@@ -448,9 +458,17 @@ window.MXLPlugins.stream_in = (function () {
           <summary>${esc(t('plugin.stream_in.audio_health'))}${audioBad ? ' ⚠' : ''}</summary>
           <table class="si-table">
             <tbody>
+              <tr><th>${esc(t('plugin.stream_in.av_lock'))}</th><td${avUnlocked ? ' class="warn"' : ''}>${esc(avTxt)}</td></tr>
+              <tr><th>${esc(t('plugin.stream_in.audio_headroom'))}</th><td${(s.audio_headroom_ms != null && s.audio_headroom_ms < 0) ? ' class="warn"' : ''}>${s.audio_headroom_ms == null ? '—' : esc(s.audio_headroom_ms + ' ms')}</td></tr>
+              <tr><th>${esc(t('plugin.stream_in.av_relocks'))}</th><td>${esc(s.av_relocks)}</td></tr>
+              <tr><th>${esc(t('plugin.stream_in.av_reanchors'))}</th><td${(s.av_reanchors || 0) > 0 ? ' class="warn"' : ''}>${esc(s.av_reanchors)}</td></tr>
+              <tr><th>${esc(t('plugin.stream_in.av_skew'))}</th><td${(s.av_skew_ms != null && Math.abs(s.av_skew_ms) > 20) ? ' class="warn"' : ''}>${s.av_skew_ms == null ? '—' : esc(s.av_skew_ms + ' ms')}</td></tr>
+              <tr><th>${esc(t('plugin.stream_in.audio_late'))}</th><td${avLate ? ' class="warn"' : ''}>${esc(s.audio_late_samples)}</td></tr>
               <tr><th>${esc(t('plugin.stream_in.audio_in_sps'))}</th><td>${esc(s.audio_in_sps)}</td></tr>
               <tr><th>${esc(t('plugin.stream_in.audio_starve'))}</th><td>${esc(s.audio_starve_blocks)}</td></tr>
+              <tr><th>${esc(t('plugin.stream_in.audio_latence'))}</th><td>${s.audio_latence_ms == null ? '—' : esc(s.audio_latence_ms + ' ms')}</td></tr>
               <tr><th>${esc(t('plugin.stream_in.audio_drop'))}</th><td>${esc(s.audio_drop_samples)}</td></tr>
+              <tr><th>${esc(t('plugin.stream_in.audio_drop_qui'))}</th><td${(s.audio_drop_plafond || 0) > 0 ? ' class="warn"' : ''}>${esc(t('plugin.stream_in.drop_ceiling') + ' ' + (s.audio_drop_plafond || 0) + ' · ' + t('plugin.stream_in.drop_drain') + ' ' + (s.audio_drop_drainage || 0) + ' · ré-ancrage ' + (s.audio_drop_reancrage || 0) + ' · génération ' + (s.audio_drop_generation || 0))}</td></tr>
               <tr><th>${esc(t('plugin.stream_in.audio_reanchor'))}</th><td>${esc(s.audio_reanchors)}</td></tr>
             </tbody>
           </table>

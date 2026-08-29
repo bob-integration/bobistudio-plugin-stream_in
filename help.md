@@ -74,17 +74,66 @@ dépend d'aucune synchro de grille (rare — ne pas désactiver sans raison pré
 L'audio du flux est décodé vers un shm 8 canaux 48 kHz (câblable page Câbles). Sans piste
 audio dans le flux, l'instance bascule automatiquement en vidéo seule (silence sur le shm).
 
+## Synchro A/V
+
+> ⚠ **Le verrou est DÉSACTIVÉ par défaut** (`av_lock`). Mesuré le 2026-08-23 sur une
+> liaison SRT réelle, il fait pire que pas de verrou : écart A/V de +275 ms au lieu de
+> +38 ms, et âge audio moins stable. Deux défauts identifiés (erreur d'origine d'environ
+> 270 ms, verrou qui se déplace trop souvent) — voir `TODO.md`. Ce qui suit décrit ce
+> qu'il fait quand on l'active, pour y travailler.
+
+L'audio n'est pas débité au fil de l'eau : il est posé **à la case de grille de la trame qui lui
+correspond**. Les deux filtres ffmpeg de la chaîne portent la même référence temporelle — la
+trame de sortie n° *n* est au pts source *n·D/N*, l'échantillon n° *s* au pts *s/48000* — donc
+trame *n* ↔ échantillon *n·48000·D/N*. Le plugin en déduit un décalage entier unique et écrit
+l'audio dessus. Sans ce verrou (`av_lock` décoché), chaque essence est cadencée séparément et la
+latence audio n'est rien d'autre que l'occupation de son tampon : elle erre, l'écart A/V ne tient
+pas — mesuré ±100 ms sur une liaison SRT réelle.
+
+**Retenue vidéo** (`av_margin_frames`, 1 trame par défaut). Verrouiller l'audio sur l'instant de
+présentation vidéo lui retire sa marge d'arrivée : le tampon ne la porte plus, et un bloc en
+retard devient du silence. La vidéo est donc présentée une trame plus tard — **les deux essences
+décalées d'autant, le lip-sync ne bouge pas** — pour rendre cette marge au chemin audio. C'est
+`audio_headroom_ms` (ci-dessous) qui doit décider de sa valeur, pas une estimation.
+
+L'état de connexion, lui, continue de se juger sur l'arrivée courante : la retenue décale
+l'image, elle ne vieillit pas le diagnostic et ne provoque pas de faux gel.
+
 ## Diagnostic audio
 
-`:8080` expose la santé du chemin audio — en régime établi, les trois compteurs doivent rester
-figés :
+`:8080` expose la santé du chemin audio — en régime établi, les compteurs doivent rester figés :
 
-- `audio_buf_ms` : occupation du tampon = **latence de l'audio par rapport à la vidéo**
-  (40–60 ms attendus). Une valeur qui monte et reste haute = audio en retard.
+- `av_locked` : le décalage A/V est **établi** (une trame présentée depuis le démarrage de
+  ffmpeg). À distinguer de `av_lock`, qui ne dit que l'état de la case à cocher : un verrou
+  demandé mais jamais accroché est précisément le cas qu'il faut voir.
+- `audio_headroom_ms` : **marge d'arrivée minimale sur la seconde écoulée** — de combien
+  l'audio devance sa case. Négatif = il arrive après, et ce qui manque part en silence. C'est la
+  mesure qui gouverne le réglage de la retenue vidéo.
+- `av_relocks` : le verrou SUIT une dérive lente (médiane de fenêtre, confirmée sur deux
+  fenêtres). Par pas d'une trame.
+- `av_reanchors` : le verrou a été RELÂCHÉ parce que plus rien n'était servi — un décrochage,
+  pas une dérive. Attendu après une reconnexion SRT (ffmpeg rattrape à 3× le temps réel et la
+  relation « trame ↔ case » ne tient pas pendant la rafale) ; anormal en régime établi.
+- `av_skew_ms` : écart entre la ligne de temps DEMANDÉE et celle qui ARRIVE. Doit être à 0 en
+  régime établi. Une valeur franche et stable dit que le verrou vise à côté.
+- `av_fallback` : non nul = le verrou a renoncé et l'audio est débité au fil de l'eau
+  (comportement d'avant la 0.9.0). Retenté automatiquement. Le voir en permanence sur une source
+  donnée est un signalement à remonter, pas un réglage à faire.
+- `audio_late_samples` : échantillons arrivés après leur case, donc jetés.
+- `audio_latence_ms` : **la latence audio réelle** — le « bas de l'eau », ce qui reste en
+  permanence dans le tampon sur une fenêtre de 2 s. C'est cette valeur que le drainage ramène
+  vers 30 ms, et la seule qui ait le sens d'une latence.
+- `audio_buf_ms` : occupation **de pic**, relevée juste après un ajout. Elle mesure la taille des
+  rafales d'écriture de ffmpeg (300–400 ms couramment), **pas** la latence. Ne pas dimensionner
+  quoi que ce soit dessus : c'est ce qui avait mis le plafond du tampon à 200 ms, sous la taille
+  des rafales, d'où 40 % de l'audio jeté à l'entrée puis autant de silence.
+- `audio_drop_plafond` / `audio_drop_drainage` / `audio_drop_reancrage` / `audio_drop_generation` :
+  QUI a jeté. Le plafond qui monte en régime établi = capacité insuffisante ou consommation en
+  retard ; le drainage = de la latence installée qu'on rend (normal, rare) ; le ré-ancrage = la
+  grille a décroché ; la génération = un reliquat d'avant une reconnexion.
 - `audio_starve_blocks` : blocs de silence insérés faute d'audio frais (s'incrémente pendant
   l'attente d'une source, c'est normal).
-- `audio_drop_samples` : échantillons jetés pour ramener la latence à la cible (une salve au
-  démarrage est normale).
+- `audio_drop_samples` : échantillons jetés (drainage sans verrou, reliquats de génération).
 - `audio_reanchors` : ré-ancrages sur la grille TAI (dérive > 250 ms de l'horloge source).
 - `audio_in_sps` : échantillons/s livrés par ffmpeg (≈ 48000).
 

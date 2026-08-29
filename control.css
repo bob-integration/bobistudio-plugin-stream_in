@@ -89,6 +89,7 @@
 .si-stat b { font-family: var(--font-mono); font-size: 1.05em; font-weight: 600; }
 .si-stat small { color: var(--text-muted); font-size: 0.74em; }
 .si-stat.warn b { color: var(--status-warning-fg); }
+.si-table td.warn { color: var(--status-warning-fg); font-weight: 600; }
 
 /* ─── Courbe de débit ──────────────────────────────────────────────────── */
 .si-chart { margin: 0; position: relative; }
