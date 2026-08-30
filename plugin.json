@@ -10,11 +10,7 @@
     "control_js": "control.js",
     "control_css": "control.css"
   },
-  "nav": {
-    "section": "sources",
-    "label": "Sources",
-    "order": 20
-  },
+  "nav": { "section": "sources", "label": "Sources", "route": "/sources", "order": 20, "group": "entrees" },
   "resources": {
     "cores": 2,
     "memory": 1024,
