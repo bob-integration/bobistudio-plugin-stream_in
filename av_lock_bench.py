@@ -49,17 +49,30 @@ check("48000·D/N = 960 échantillons/trame à 50p", R == 960, "R=%d" % R)
 check("trame 0 → échantillon 0", M["_samples_at_frame"](0) == 0)
 check("trame 100 → échantillon 96000", M["_samples_at_frame"](100) == 96000)
 
-# ── pont d'horloge : la case k doit tomber sur l'index TAI du MÊME instant ──────────
+# ── la grille EST celle du bus : c'est elle qui estampille les grains VIDÉO ─────────
+# Jusqu'au 2026-10-25, `_grid_now_ns()` rendait CLOCK_REALTIME. Les index vidéo posés par
+# `_write_video(index=fbase)` tombaient donc 37 s — 1850 créneaux à 50p — SOUS la grille TAI du
+# bus, et tout délai d'étage mesuré en aval dépassait la borne de plausibilité de 10 s. Rien ici
+# ne le voyait : les deux assertions qui vivaient à cet endroit ne testaient que le PONT vers
+# l'audio, c'est-à-dire la conséquence corrigée à la main, et pas la cause. Mesuré le 25/10 dans
+# un conteneur de dell-1 : l'horloge système y vaut l'UTC, l'écart est bien de 37,000 s.
+ecart_horloge = M["_grid_now_ns"]() - fake.now_tai()
+check("l'horloge de la grille EST celle du bus (TAI)",
+      abs(ecart_horloge) <= 2_000_000, "écart=%+.3f s" % (ecart_horloge / 1e9))
 k = M["_grid_k"](M["_grid_now_ns"]())
-want = (M["_grid_ns"](k) + TAI_OFFSET_NS) * 48000 // 1_000_000_000
-# Tolérance de 2 échantillons (40 µs) : l'écart d'horloge est mesuré à chaud (deux lectures
-# consécutives), il jitte donc d'une poignée de ns — sans conséquence, D n'est calculé qu'une
-# fois par accrochage.
-check("case de grille → index TAI (décalage 37 s pris en compte)",
-      abs(M["_grid_tai_sample"](k) - want) <= 2, "écart=%d" % (M["_grid_tai_sample"](k) - want))
-check("sans le pont, l'erreur vaudrait 37 s d'échantillons",
-      abs(abs(M["_grid_tai_sample"](k) - M["_grid_ns"](k) * 48000 // 1_000_000_000)
-          - 37 * 48000) <= 2)
+k_tai = fake.now_tai() * 50 // 1_000_000_000
+check("la case vidéo posée est la case TAI, pas 1850 créneaux plus bas",
+      abs(k - k_tai) <= 1, "k - k_tai = %d" % (k - k_tai))
+# Tolérance de 2 échantillons (40 µs) : l'écart d'horloge est relevé à chaud au chargement du
+# module (deux lectures consécutives), il jitte donc d'une poignée de ns — sans conséquence,
+# D n'est calculé qu'une fois par accrochage.
+# Référence prise sur l'horloge du BUS, pas sur `_grid_ns` : comparer `_grid_tai_sample(k)` à
+# `_grid_ns(k)` serait tautologique (les deux en dérivent), et l'assertion resterait verte même
+# avec la grille remise sur CLOCK_REALTIME — vérifié par mutation le 25/10.
+want = fake.now_tai() * 48000 // 1_000_000_000
+check("case de grille → index TAI d'échantillon du MÊME instant",
+      abs(M["_grid_tai_sample"](k) - want) <= 960, "écart=%d échantillons"
+      % (M["_grid_tai_sample"](k) - want))
 
 # ── accrochage du verrou et zone morte ─────────────────────────────────────────────
 M["_av_gen"] = 1

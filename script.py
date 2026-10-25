@@ -491,25 +491,43 @@ def _grid_ns(k):
     return round(k * 1_000_000_000 * FPS_DEN / FPS_NUM) + _PHASE_NS
 def _grid_k(ns):
     return (ns - _PHASE_NS) * FPS_NUM // (1_000_000_000 * FPS_DEN)
-def _grid_now_ns():
-    return time.clock_gettime_ns(time.CLOCK_REALTIME)
-def _grid_sleep_until(deadline_ns):
-    dt = (deadline_ns - _grid_now_ns()) / 1e9
-    if dt > 0: time.sleep(dt)
-
 def _tai_offset_ns():
-    """Écart horloge de la grille genlock (CLOCK_REALTIME) → horloge TAI du bus MXL.
-    Les index de grain VIDÉO sont posés depuis la grille, les index AUDIO depuis now_tai() :
-    sur un conteneur dont l'horloge n'est pas déjà en TAI, poser l'audio à la case de la
-    vidéo sans cette conversion le décalerait de l'écart TAI-UTC entier (37 s)."""
+    """Écart CLOCK_REALTIME → horloge TAI du bus MXL, 0 si la mesure échoue.
+
+    Mesuré le 2026-10-25 dans un conteneur de dell-1 : **37,000 s exactement** — l'horloge
+    système des conteneurs est l'UTC, PAS le TAI. Ce n'est donc pas un cas de bord."""
     try:
         return bobimxl.now_tai() - time.clock_gettime_ns(time.CLOCK_REALTIME)
     except Exception:
         return 0
 
+# Posé UNE fois : l'écart TAI-UTC ne bouge qu'à une seconde intercalaire, et `_grid_now_ns` est
+# sur le chemin chaud (plusieurs appels par trame). Un `now_tai()` par appel coûterait un aller
+# ctypes pour une constante.
+_GRID_TAI_OFF = _tai_offset_ns()
+
+def _grid_now_ns():
+    """Maintenant, SUR LA GRILLE TAI du bus — et c'est ce qui rend l'index publiable.
+
+    ⚠ Cette fonction rendait CLOCK_REALTIME jusqu'au 2026-10-25, et c'était un défaut : en mode
+    genlock, `_write_video` pose l'index du grain depuis `_grid_k(_grid_now_ns())`, et un index
+    de grain est normativement une COORDONNÉE SUR LA GRILLE TAI (docs/Timing.md du SDK). Sur un
+    conteneur dont l'horloge est l'UTC — tous les nôtres, mesuré 37,000 s —, on publiait donc des
+    grains estampillés 37 s DANS LE PASSÉ, soit 1850 créneaux trop bas à 50p. Conséquence : tout
+    délai d'étage mesuré en aval dépasse la borne de plausibilité (10 s) et sort en
+    « non mesurable », sans que rien ne dise pourquoi. Jamais vu en service parce qu'aucun
+    stream_in n'était déployé.
+    Les autres usages de cette horloge (fenêtres de 1 s, bas de l'eau du tampon, cadencement)
+    ne travaillent que sur des DIFFÉRENCES : les décaler d'une constante ne change rien."""
+    return time.clock_gettime_ns(time.CLOCK_REALTIME) + _GRID_TAI_OFF
+def _grid_sleep_until(deadline_ns):
+    dt = (deadline_ns - _grid_now_ns()) / 1e9
+    if dt > 0: time.sleep(dt)
+
 def _grid_tai_sample(k):
-    """Case de grille vidéo k → index TAI d'échantillon audio du MÊME instant."""
-    return (_grid_ns(k) + _tai_offset_ns()) * A_SAMPLE_RATE // 1_000_000_000
+    """Case de grille vidéo k → index TAI d'échantillon audio du MÊME instant.
+    La grille étant désormais en TAI (cf. `_grid_now_ns`), il n'y a plus de pont à franchir."""
+    return _grid_ns(k) * A_SAMPLE_RATE // 1_000_000_000
 
 def _av_note(gen, n, k):
     """Constat de présentation : la trame n (de la génération gen) part à la case k.
