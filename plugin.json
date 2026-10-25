@@ -3,7 +3,7 @@
   "label": "Stream In",
   "runtime": "docker",
   "image": "media",
-  "version": "0.9.15",
+  "version": "0.9.16",
   "script_template": "script.py",
   "ui": {
     "control_html": "control.html",

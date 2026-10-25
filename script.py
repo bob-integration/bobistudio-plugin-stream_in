@@ -588,12 +588,6 @@ def _split_fields(full_b):
         off += psz
     return bytes(a), bytes(b)
 
-# Dernier (writer, index) vidéo RÉELLEMENT posé, pour `grid_ahead_ms` sur :8080. Relevé ici
-# plutôt que calculé par trame : la comparaison à l'horloge se fait à la requête, coût nul.
-# Progressif seulement — en entrelacé l'index est une coordonnée de CHAMP sur un flux à la
-# cadence TRAME, et `index_time_ns` rendrait un instant faux d'un facteur deux.
-_LAST_VID_IDX = [None, 0]
-
 def _write_video(w, frame_bytes, fbase):
     try:
         if INTERLACED:
@@ -606,11 +600,9 @@ def _write_video(w, frame_bytes, fbase):
             # MODE TRANCHE : émission par bandes de la trame déjà complète (commit progressif).
             # Même open_grain (index genlock inchangé), même pacing — seul le commit change.
             _i, gi, vw = w.open_grain(index=(fbase if GENLOCK else None))
-            _LAST_VID_IDX[0] = w; _LAST_VID_IDX[1] = _i
             _emit_grain_sliced(w, gi, vw, frame_bytes)
         else:
             _i, gi, vw = w.open_grain(index=(fbase if GENLOCK else None))
-            _LAST_VID_IDX[0] = w; _LAST_VID_IDX[1] = _i
             n = min(len(frame_bytes), len(vw))
             vw[:n] = np.frombuffer(frame_bytes, dtype=np.uint8, count=n)
             w.commit(gi)
@@ -1375,23 +1367,18 @@ def _state_payload():
 class MetricsHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         with metrics_lock: payload = dict(metrics)
-        # Avance des index ÉMIS sur la grille TAI (cf. bobimxl.index_report) : seul témoin d'une
-        # sortie écrite dans le FUTUR, épisode pendant lequel la cadence reste parfaite et où
-        # tout délai d'étage mesuré en aval est refusé sans dire pourquoi (régie légère, 25/10 :
-        # deux mélangeurs à 68 s d'avance pendant des heures).
-        # ⚠ PORTÉE, et elle n'est pas intuitive : en mode genlock (LE DÉFAUT ici), l'index vidéo
-        # est posé par `_write_video` depuis `_grid_k`, et `next_index` n'est jamais appelé — ce
-        # rapport reste donc vide et ne dit RIEN du chemin genlock. Publier `index_ahead` seul
-        # serait un faux témoin. C'est `grid_ahead_ms` qui mesure ce chemin-là, en comparant
-        # l'index RÉELLEMENT posé à la grille TAI du bus ; les deux sont nécessaires.
+        # Écart des index ÉMIS à la grille TAI (cf. bobimxl.index_report, clé `grid_ms` par flux,
+        # ms signées, positif = dans le futur) : seul témoin d'une sortie écrite dans le FUTUR,
+        # épisode pendant lequel la cadence reste parfaite et où tout délai d'étage mesuré en aval
+        # est refusé sans dire pourquoi (régie légère, 25/10 : deux mélangeurs à 68 s d'avance
+        # pendant des heures).
+        # Ce rapport couvre AUSSI le mode genlock, où `_write_video` pose l'index à la main sans
+        # passer par `next_index` : bobimxl mesure le dernier index RÉELLEMENT ouvert, donc les
+        # deux familles de writers. Il tient même compte de l'entrelacé (cadence CHAMP déduite de
+        # l'`interlace_mode` du flowDef, que ce plugin déclare). D'où le retrait de la clé
+        # `grid_ahead_ms` que ce script a portée le temps d'une version : deux clés pour la même
+        # grandeur, c'est deux conventions à confondre un jour.
         payload["index_ahead"] = bobimxl.index_report()
-        if _LAST_VID_IDX[0] is not None:
-            try:
-                payload["grid_ahead_ms"] = round(
-                    (_LAST_VID_IDX[0].index_time_ns(_LAST_VID_IDX[1])
-                     - bobimxl.now_tai()) / 1e6, 1)
-            except Exception:
-                pass
         body = json.dumps(payload).encode()
         self.send_response(200); self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body))); self.end_headers()
