@@ -3,7 +3,7 @@
   "label": "Stream In",
   "runtime": "docker",
   "image": "media",
-  "version": "0.9.16",
+  "version": "0.9.17",
   "script_template": "script.py",
   "ui": {
     "control_html": "control.html",
@@ -398,5 +398,19 @@
         }
       }
     ]
-  }
+  },
+  "ports": [
+    {
+      "param": "listen_port",
+      "proto": "udp",
+      "when": { "mode": ["srt_listener"] },
+      "desc": "SRT en écoute : la source (OBS, encodeur de reportage) pousse vers ce port."
+    },
+    {
+      "port": 1935,
+      "proto": "tcp",
+      "when": { "mode": ["rtmp_server"] },
+      "desc": "RTMP serveur : l'encodeur pousse vers ce port."
+    }
+  ]
 }
