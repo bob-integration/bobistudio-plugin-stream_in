@@ -242,7 +242,9 @@ def _emit_grain_sliced(w, gi, vw, data):
 
 A_SAMPLE_RATE = 48000
 A_CHANNELS    = 8
-A_SPMS        = A_SAMPLE_RATE // 1000        # samples per ms (48)
+A_SPMS        = A_SAMPLE_RATE // 1000        # samples per ms (48)  # per-ms, not the bus grain
+# Audio packet size on the bus: core setting (Réglages → MXL). An older orchestrator has no helper: 1 ms.
+A_GRAIN       = bobimxl.audio_grain(CONFIG, A_SAMPLE_RATE) if hasattr(bobimxl, "audio_grain") else 48
 
 def _samples_at_frame(n):
     """Numéro d'échantillon audio du DÉBUT de la trame n, sur l'axe de pts partagé par les
@@ -1045,14 +1047,10 @@ def video_feeder():
 # `mxlGetCurrentIndex() - n` à CHAQUE appel — deux écritures rapprochées retombent alors sur
 # le même index (écrasement) ou en sautent (les vieux échantillons du ring ressortent), ce qui
 # s'entend en clics. On ancre une fois sur la grille d'échantillons TAI puis on avance de n.
-# Granularité d'écriture = 1 ms, comme player/avsync. C'est un CONTRAT avec les consommateurs :
-# le streamer lit par blocs de 1 ms et, dès qu'un passage ne trouve pas de bloc complet, il
-# injecte du silence pour combler les ms écoulées (script.py:audio_feeder). Écrire par blocs de
-# 5 ms fait avancer head_index par sauts de 5 ms → le consommateur tourne à vide 4 passages sur 5
-# et bourre du silence : l'audio « saute ». Ne pas augmenter sans revoir les consommateurs.
-# NB : le réglage `mtl_audio_ptime` (1 ms / 125 µs) est le packet time RÉSEAU ST 2110-30 du moteur
-# 2110_io, pas la granularité du bus — même en 125 µs le chunk shm reste 1 ms. Rien à suivre ici.
-A_BLK = A_SPMS                           # 48 samples = 1 ms
+# Write packet size = core setting `mxl_audio_grain_us` (Réglages → MXL), via bobimxl.audio_grain.
+# The bus itself has no grain (continuous sample ring); this is only how many samples we write
+# per call. Consumers read the ring by index, so they follow whatever size is configured.
+A_BLK = A_GRAIN                          # samples per write/read pass (1 ms by default)
 A_MAX_LAG = A_SAMPLE_RATE // 4           # 250 ms de dérive tolérée avant ré-ancrage
 
 def _tai_sample_index():

@@ -1,7 +1,10 @@
 {
-  "version": "0.9.11",
-  "date": "2026-08-23",
+  "version": "0.9.18",
+  "date": "2026-11-09",
   "changes": {
+    "Taille des paquets audio sur le bus : réglage du cœur (0.9.18)": [
+      "Le nombre d'échantillons écrits par passage sur le flux audio MXL n'est plus figé à 1 ms (`SAMPLE_RATE // 1000`) : il vient de `bobimxl.audio_grain(CONFIG, sample_rate)`, réglage `mxl_audio_grain_us` de Réglages → MXL, injecté par l'orchestrateur. Le bus n'a pas de grain (anneau continu d'échantillons) ; les commentaires qui le prétendaient sont retirés. `A_SPMS` reste la conversion ms ↔ échantillons (tampons, latences). Repli à 48 échantillons sur un orchestrateur sans l'aide. Aucun changement de comportement au réglage actuel (1 ms)."
+    ],
     "Tampon audio : 40 % de l'audio jeté au plafond, en régime PAR DÉFAUT (0.9.11)": [
       "⚠ Ce correctif porte sur le chemin LIBRE — celui de TOUS les `stream_in`, verrou ou pas, et le défaut est antérieur au chantier du verrou A/V. MESURÉ au banc sur une entrée en rafales : **40 % de l'audio entrant jeté et 40 % des blocs comblés au silence**, en régime permanent.",
       "Cause : le plafond du tampon (200 ms) était plus BAS que les rafales d'écriture de ffmpeg dans le fifo (~370 ms mesurés). On écrêtait donc chaque rafale à l'entrée, puis on affamait en attendant la suivante. Le tampon collé à 200 ms n'était pas « plein » : il était ÉCRÊTÉ. Le plafond passe à 1 s dans les deux régimes — c'est une CAPACITÉ, pas une latence (coût 1,5 Mo).",
