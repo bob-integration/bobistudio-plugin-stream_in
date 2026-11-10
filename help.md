@@ -137,9 +137,11 @@ l'image, elle ne vieillit pas le diagnostic et ne provoque pas de faux gel.
 - `audio_reanchors` : ré-ancrages sur la grille TAI (dérive > 250 ms de l'horloge source).
 - `audio_in_sps` : échantillons/s livrés par ffmpeg (≈ 48000).
 
-Le flux audio est écrit sur le bus par blocs de **1 ms** : c'est le contrat attendu par les
-consommateurs (le streamer lit par blocs de 1 ms et comble au silence ce qui manque). Ne pas
-augmenter cette granularité — l'audio se mettrait à sauter chez les consommateurs.
+Le flux audio est écrit sur le bus par paquets dont la taille vient du **réglage du cœur**
+(Réglages → MXL, `mxl_audio_grain_us`, 1 ms par défaut) : le plugin la lit par
+`bobimxl.audio_grain()` et le flux l'annonce, il ne la décide pas. Ce fichier affirmait « ne pas
+augmenter cette granularité » quand le 1 ms était une convention recopiée dans chaque plugin ; elle
+est désormais déclarée en un seul endroit, et un plugin écrit avant le réglage retombe sur 1 ms.
 
 ## Mode tranche (latence réduite)
 
